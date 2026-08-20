@@ -1,7 +1,8 @@
 # omp-gateway
 
-Single resident gateway process for [omp](https://github.com/can1357/oh-my-pi)
-(Oh My Pi): **cron scheduler + QQ gateway** in one daemon, driven by `omp --mode rpc`.
+Single resident gateway daemon for [omp](https://github.com/can1357/oh-my-pi)
+(Oh My Pi): **cron scheduler + QQ gateway** in one process, driven by
+`omp --mode rpc`. Full TypeScript/Bun stack.
 
 Successor of the archived [omp-scheduler](https://github.com/crafter-z/omp-scheduler)
 and [omp-qq-bridge](https://github.com/crafter-z/omp-qq-bridge) skeletons.
@@ -10,42 +11,54 @@ replacing hermes's gateway process (cron `cronjob` + official QQ Bot API v2 adap
 
 ## Status
 
-**Skeleton only** — repository initialized, no implementation yet.
+**Planning** — design docs complete (`docs/`), no implementation yet.
 
-## Architecture (planned)
+## Architecture
 
 ```
 [QQ mobile/desktop] ⇄ [official QQ Bot API v2: WS inbound + REST outbound]
                           │
                           ▼
-              [omp-gateway daemon (Python, asyncio)]
-                ├── qq_gateway module    (C2C/group@guild, per-chat sessions)
-                ├── scheduler module     (APScheduler, job store, delivery)
-                └── omp_rpc client       (spawns `omp --mode rpc` per turn)
+              [omp-gateway daemon (TypeScript/Bun, resident)]
+                ├── qq module         (C2C/group@guild, per-chat sessions)
+                ├── scheduler module  (croner, job store, execution ledger)
+                ├── delivery module   (file / QQ / origin targets)
+                └── omp-rpc client    (spawns `omp --mode rpc` per turn)
                           │
                           ▼
                      [omp agent]
 ```
 
-- Single process = no cross-process delivery contract; cron results deliver to QQ directly
-- `QQBOT_HOME_CHANNEL` shared as default delivery target
-- Runs as a resident service (Windows Task Scheduler / NSSM)
+- **Phase 1**: standalone daemon + CLI (`omp-gateway start|stop|status`) — no
+  plugin dependency; cron and QQ run fully headless
+- **Phase 2**: optional omp extension shell (`omp plugin install`) bridging the
+  daemon into live TUI sessions (message injection, `/gateway` commands, `qq_send` tool)
+
+See `docs/01-architecture.md` for details.
 
 ## Planned Scope
 
-- **scheduler**: one-shot / recurring / cron-expression jobs, natural-language parsing,
-  per-job fresh agent session, no-agent `$0` script mode, execution ledger with crash recovery,
-  anti-overlap locking, per-job tools/skills binding, misfire catch-up
-- **qq_gateway**: official QQ Bot API v2 (C2C private, group @-mentions, guild),
+- **scheduler**: one-shot / recurring / cron-expression / natural-language jobs,
+  per-job fresh agent session, no-agent `$0` script mode, execution ledger with
+  crash recovery, anti-overlap locking, per-job tools/skills binding, misfire catch-up
+- **qq**: official QQ Bot API v2 (C2C private, group @-mentions, guild),
   persistent WebSocket inbound, REST outbound (text/Markdown/images/files),
   voice transcription (QQ ASR + configurable STT), per-chat session mapping,
   user/group allowlists, home channel
+- **delivery**: file / QQ / origin targets, SILENT mode, continuable replies
 
 ## Development
 
-Requires Python 3.11+, [Bun](https://bun.sh) (omp), and omp.
+Requires Bun 1.3.14+ (omp) and Node/Bun toolchain.
 
 ```bash
-pip install -e .
+bun install
 bun test
 ```
+
+## Docs
+
+- `docs/01-architecture.md` — process model, module boundaries, data flow
+- `docs/02-contracts.md` — config schema, job model, execution ledger, IPC protocol
+- `docs/03-capability-gap.md` — hermes capability baseline vs. this project
+- `docs/04-roadmap.md` — phased implementation plan
