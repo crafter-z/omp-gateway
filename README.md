@@ -62,3 +62,4 @@ bun test
 - `docs/02-contracts.md` — config schema, job model, execution ledger, IPC protocol
 - `docs/03-capability-gap.md` — hermes capability baseline vs. this project
 - `docs/04-roadmap.md` — phased implementation plan
+- `docs/05-implementation-plan.md` — concrete implementation plan: stack, file tree, type skeleton, per-phase steps
