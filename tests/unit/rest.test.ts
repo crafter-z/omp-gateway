@@ -1,9 +1,13 @@
 /**
  * Unit tests for the QQ REST client (rest.ts) using a global fetch mock.
- * Verifies token acquisition + caching and sendText URL/body/headers.
+ * Verifies token acquisition + caching, sendText URL/body/headers, and
+ * sendMedia's upload-then-message flow.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { resetAccessTokenCache, sendText } from "../../src/qq/rest.ts";
+import { unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { resetAccessTokenCache, sendMedia, sendText } from "../../src/qq/rest.ts";
 import type { ChatRef, QqConfig } from "../../src/qq/types.ts";
 
 const CFG: QqConfig = { app_id: "app-1", app_secret: "sec-1" };
@@ -101,5 +105,163 @@ describe("sendText", () => {
     await expect(sendText(CFG, { chatKey: "c2c:u1", openid: "u1" }, "x")).rejects.toThrow(
       /getAppAccessToken failed \(401\)/,
     );
+  });
+});
+
+describe("sendMedia", () => {
+  const MEDIA_BYTES = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+  let tmpFile: string | null = null;
+
+  afterEach(async () => {
+    if (tmpFile) {
+      await unlink(tmpFile).catch(() => {});
+      tmpFile = null;
+    }
+  });
+
+  function makeMediaFile(): string {
+    tmpFile = join(tmpdir(), `omp-gw-rest-media-${crypto.randomUUID()}.png`);
+    return tmpFile;
+  }
+
+  /** Happy-path mock: token → upload (file_uuid) → message (id). */
+  function mediaMock() {
+    return mock(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetchCalls.push({ url, init });
+      if (url.includes("/app/getAppAccessToken")) {
+        return jsonResponse({ access_token: "tok-123", expires_in: 7200 });
+      }
+      if (url.includes("/files")) return jsonResponse({ file_uuid: "uuid-1" });
+      return jsonResponse({ id: "media-msg-1" });
+    }) as unknown as typeof fetch;
+  }
+
+  test("uploads image file then posts media message", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mediaMock();
+
+    const res = await sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image");
+
+    expect(res).toEqual({ id: "media-msg-1" });
+    expect(fetchCalls.map((c) => c.url)).toEqual([
+      "https://apps.q.qq.com/app/getAppAccessToken",
+      "https://api.q.qq.com/v2/users/u1/files",
+      "https://api.q.qq.com/v2/users/u1/messages",
+    ]);
+    // upload: multipart form with the raw bytes + file_type 1
+    const upload = fetchCalls[1]!;
+    expect(upload.init?.method).toBe("POST");
+    expect(upload.init?.headers).toMatchObject({ Authorization: "QQBot tok-123" });
+    const form = upload.init?.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.get("file_type")).toBe("1");
+    const filePart = form.get("file_uuid") as File;
+    expect(filePart.name).toBe(basename(filePath));
+    expect(new Uint8Array(await filePart.arrayBuffer())).toEqual(MEDIA_BYTES);
+    // message: media reference
+    expect(bodyOf(fetchCalls[2]!)).toEqual({ content: " ", msg_type: 0, media: { file_uuid: "uuid-1" } });
+  });
+
+  test("routes group uploads to /v2/groups/{gid}/files", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mediaMock();
+
+    const res = await sendMedia(CFG, { chatKey: "group:g9", openid: "g9" }, filePath, "image");
+    expect(res.id).toBe("media-msg-1");
+    expect(fetchCalls[1]!.url).toBe("https://api.q.qq.com/v2/groups/g9/files");
+    expect(fetchCalls[2]!.url).toBe("https://api.q.qq.com/v2/groups/g9/messages");
+  });
+
+  test("file kind uploads with file_type 3", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mediaMock();
+
+    await sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "file");
+    const form = fetchCalls[1]!.init?.body as FormData;
+    expect(form.get("file_type")).toBe("3");
+  });
+
+  test("echoes msg_id on the media message", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mediaMock();
+
+    await sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image", { msgId: "in-7" });
+    expect(bodyOf(fetchCalls[2]!)).toEqual({
+      content: " ",
+      msg_type: 0,
+      msg_id: "in-7",
+      media: { file_uuid: "uuid-1" },
+    });
+  });
+
+  test("honors portal_host on both upload and message calls", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    const cfg: QqConfig = { app_id: "app-1", app_secret: "sec-1", portal_host: "sandbox.q.qq.com" };
+    globalThis.fetch = mediaMock();
+
+    await sendMedia(cfg, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image");
+    expect(fetchCalls[1]!.url).toBe("https://api.sandbox.q.qq.com/v2/users/u1/files");
+    expect(fetchCalls[2]!.url).toBe("https://api.sandbox.q.qq.com/v2/users/u1/messages");
+  });
+
+  test("throws with the response body when the upload fails", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetchCalls.push({ url });
+      if (url.includes("/app/getAppAccessToken")) {
+        return jsonResponse({ access_token: "tok-123", expires_in: 7200 });
+      }
+      return jsonResponse({ code: 9, message: "upload refused" }, 400);
+    }) as unknown as typeof fetch;
+
+    await expect(sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image")).rejects.toThrow(
+      /400.*upload refused/,
+    );
+    expect(fetchCalls).toHaveLength(2); // token + failed upload, no message call
+  });
+
+  test("throws when the upload response lacks file_uuid", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetchCalls.push({ url });
+      if (url.includes("/app/getAppAccessToken")) {
+        return jsonResponse({ access_token: "tok-123", expires_in: 7200 });
+      }
+      return jsonResponse({ id: "not-a-file-uuid" });
+    }) as unknown as typeof fetch;
+
+    await expect(sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image")).rejects.toThrow(
+      /file_uuid/,
+    );
+    expect(fetchCalls).toHaveLength(2);
+  });
+
+  test("throws when the media message call fails", async () => {
+    const filePath = makeMediaFile();
+    await Bun.write(filePath, MEDIA_BYTES);
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetchCalls.push({ url });
+      if (url.includes("/app/getAppAccessToken")) {
+        return jsonResponse({ access_token: "tok-123", expires_in: 7200 });
+      }
+      if (url.includes("/files")) return jsonResponse({ file_uuid: "uuid-1" });
+      return jsonResponse({ code: 50012, message: "media denied" }, 403);
+    }) as unknown as typeof fetch;
+
+    await expect(sendMedia(CFG, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image")).rejects.toThrow(
+      /403.*media denied/,
+    );
+    expect(fetchCalls).toHaveLength(3);
   });
 });

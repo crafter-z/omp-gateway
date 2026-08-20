@@ -1,7 +1,8 @@
 /**
  * 调度器：croner 注册 enabled job（cron/interval/once 三类表达式），触发时走
  * ledger.claim 防重叠 + maxConcurrentJobs 并发闸，执行完成后回写台账与 next_run；
- * 周期 tick 扫描超时台账（misfire 补跑留 P5，M1 只扫描标记）。
+ * 周期 tick 扫描超时台账（→ unknown），并在 misfireGraceS 宽限窗口内对
+ * enabled 且未在跑的 job 补跑一次（P5）。
  *
  * M1 依赖说明：模块间零文件共享，故内部自带轻量日志（console.error），
  * daemon 接线时可替换为 util/logger。
@@ -31,6 +32,8 @@ export class Scheduler {
   private tickHandle: ReturnType<typeof setInterval> | null = null;
   private activeCount = 0;
   private readonly inFlight = new Set<string>();
+  /** 已补跑过的 execution id（防同一 unknown 记录被重复补跑） */
+  private readonly misfired = new Set<string>();
   private started = false;
 
   constructor(
@@ -201,12 +204,33 @@ export class Scheduler {
     this.store.update(jobId, { next_run: next ? next.toISOString() : null });
   }
 
-  /** 周期扫描：超时台账 → unknown（misfire 补跑留 P5，本次仅扫描标记）。 */
+  /**
+   * 周期扫描：超时台账 → unknown；随后对 scheduled_at 落在 misfireGraceS 宽限窗口内、
+   * job 仍 enabled 且未在跑的 execution 触发一次补跑（防重复：execution id 记入集合）。
+   */
   private onTick(): void {
     const timeoutMs = this.opts.misfireGraceS * 1000;
     const stale = this.ledger.scanStale(timeoutMs);
     for (const s of stale) {
       this.log(`execution ${s.id} (job ${s.job_id}) marked unknown: stale after ${timeoutMs}ms`);
+    }
+    if (stale.length === 0) return;
+
+    const nowMs = Date.now();
+    for (const s of stale) {
+      if (this.misfired.has(s.id)) continue; // 已补跑过，防重复
+      const scheduledMs = new Date(s.scheduled_at).getTime();
+      if (!Number.isFinite(scheduledMs) || nowMs - scheduledMs > this.opts.misfireGraceS * 1000) {
+        continue; // 超出宽限窗口，放弃补跑
+      }
+      const job = this.store.get(s.job_id);
+      if (!job || !job.enabled) continue;
+      if (job.status === "running" || this.inFlight.has(s.job_id)) continue;
+      this.misfired.add(s.id);
+      this.log(
+        `misfire recovery: re-firing job ${job.id} (${job.name}) for execution ${s.id} scheduled at ${s.scheduled_at}`,
+      );
+      void this.fire(s.job_id);
     }
   }
 

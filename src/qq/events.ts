@@ -60,6 +60,8 @@ export function parseEvent(raw: unknown): InboundMessage | null {
   if (t !== C2C_MESSAGE_CREATE && t !== GROUP_AT_MESSAGE_CREATE) return null;
   const d = isRecord(raw.d) ? raw.d : null;
   if (!d) return null;
+  // Markdown (msg_type 2) messages carry no plain content — skip them.
+  if (d.msg_type === 2) return null;
   const id = asString(d.id);
   if (!id) return null;
   const author = isRecord(d.author) ? d.author : null;

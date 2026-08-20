@@ -52,3 +52,19 @@ export type ChatRef = { chatKey: string; openid: string };
 export interface QqGatewayOptions {
   wsUrl?: string;
 }
+
+/**
+ * STT provider config for voice attachment transcription (config qq.stt).
+ * Mirrors qqSttConfigSchema so the qq module stays dependency-free; the
+ * daemon adapts the zod-inferred shape into this one (structurally equal).
+ */
+export interface QqSttConfig {
+  /** "zai" (GLM-ASR) | "openai" (OpenAI-compatible endpoint) | "none" (disabled). */
+  provider: "zai" | "openai" | "none";
+  /** API base URL; empty selects the provider default. */
+  base_url: string;
+  /** API key sent as `Authorization: Bearer <key>`. */
+  api_key: string;
+  /** STT model id (zai default: glm-asr). */
+  model: string;
+}

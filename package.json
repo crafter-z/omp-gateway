@@ -12,6 +12,9 @@
     "dev": "bun --watch src/index.ts",
     "build": "bun build --compile src/index.ts --outfile dist/omp-gateway"
   },
+  "omp": {
+    "extensions": ["./src/extension/index.ts"]
+  },
   "dependencies": {
     "commander": "^12.0.0",
     "croner": "^9.0.0",
@@ -19,6 +22,7 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.4.0",
     "@types/bun": "latest",
     "typescript": "^5.7.0"
   }

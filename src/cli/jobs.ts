@@ -8,6 +8,8 @@
 import { Command } from "commander";
 import { loadConfig } from "../config/load.ts";
 import { JobStore } from "../scheduler/store.ts";
+import { parseSchedule } from "../scheduler/nl.ts";
+import { preflightJob } from "../scheduler/preflight.ts";
 import type { JobSchedule } from "../scheduler/types.ts";
 
 function openStore(configArg: string | undefined): JobStore {
@@ -15,14 +17,28 @@ function openStore(configArg: string | undefined): JobStore {
 	return new JobStore(cfg.scheduler.ledger);
 }
 
-function scheduleFromOpts(opts: { every?: string; cron?: string; at?: string }): JobSchedule {
+const SUPPORTED_SCHEDULE_FORMATS =
+	"--every <interval> (e.g. 5m, 30s, 2h) | --cron <6-field expr> (sec min hour dom month dow) | " +
+	"--at <+30m|ISO> | --schedule <natural language> (e.g. \"every 5 minutes\", \"every sunday 9am\", \"每天 9 点\", \"每周一 9点\", \"in 30 minutes\")";
+
+function scheduleFromOpts(opts: { every?: string; cron?: string; at?: string; schedule?: string }): JobSchedule {
 	const present = [opts.every, opts.cron, opts.at].filter((v) => v !== undefined);
-	if (present.length !== 1) {
-		throw new Error("exactly one of --every / --cron / --at is required");
+	if (present.length > 1) {
+		throw new Error(`at most one of --every / --cron / --at / --schedule is allowed (got ${present.length})`);
 	}
-	if (opts.every !== undefined) return { kind: "interval", expr: opts.every };
-	if (opts.cron !== undefined) return { kind: "cron", expr: opts.cron };
-	return { kind: "once", expr: opts.at! };
+	if (present.length === 1) {
+		if (opts.every !== undefined) return { kind: "interval", expr: opts.every };
+		if (opts.cron !== undefined) return { kind: "cron", expr: opts.cron };
+		return { kind: "once", expr: opts.at! };
+	}
+	if (opts.schedule !== undefined) {
+		const parsed = parseSchedule(opts.schedule);
+		if (!parsed) {
+			throw new Error(`cannot parse schedule "${opts.schedule}". Supported: ${SUPPORTED_SCHEDULE_FORMATS}`);
+		}
+		return parsed;
+	}
+	throw new Error(`one of --every / --cron / --at / --schedule is required. Supported: ${SUPPORTED_SCHEDULE_FORMATS}`);
 }
 
 export function jobsCommand(): Command {
@@ -53,11 +69,12 @@ export function jobsCommand(): Command {
 
 	jobs
 		.command("add")
-		.description("add a job (--every/--cron/--at exactly one; --prompt or --script)")
+		.description("add a job (one of --every/--cron/--at/--schedule; --prompt or --script)")
 		.requiredOption("--name <name>", "unique job name")
 		.option("--every <interval>", 'interval schedule, e.g. "5m"')
 		.option("--cron <expr>", "cron schedule (6 fields, seconds first)")
 		.option("--at <expr>", 'one-shot: "+30m" or ISO timestamp')
+		.option("--schedule <nl>", 'natural language schedule, e.g. "every 5 minutes", "每天 9 点"')
 		.option("--prompt <text>", "agent prompt")
 		.option("--script <path>", "no-agent script file path")
 		.option("--model <model>", "per-job model pin")
@@ -88,23 +105,31 @@ export function jobsCommand(): Command {
 							// 显式 --no-wake-agent → 预检门；否则纯脚本（无 prompt 无可唤醒）
 							wake_agent: opts.wakeAgent === false ? false : undefined,
 						};
+			const jobInput = {
+				name: opts.name,
+				enabled: true,
+				schedule,
+				action,
+				delivery: {
+					target: opts.target,
+					file: opts.file,
+					qq_chat: opts.qqChat,
+					silent: opts.silent ?? false,
+				},
+				workdir: opts.workdir,
+				max_runs: opts.maxRuns,
+				ttl_s: opts.ttl,
+			};
+			// preflight：有错则打印并不写入（exit 1）
+			const errors = preflightJob(jobInput);
+			if (errors.length > 0) {
+				for (const e of errors) console.error(`preflight: ${e}`);
+				process.exitCode = 1;
+				return;
+			}
 			const store = openStore(opts.config);
 			try {
-				const job = store.add({
-					name: opts.name,
-					enabled: true,
-					schedule,
-					action,
-					delivery: {
-						target: opts.target,
-						file: opts.file,
-						qq_chat: opts.qqChat,
-						silent: opts.silent ?? false,
-					},
-					workdir: opts.workdir,
-					max_runs: opts.maxRuns,
-					ttl_s: opts.ttl,
-				});
+				const job = store.add(jobInput);
 				console.log(`added job ${job.id} (${job.name}) — restart daemon or use 'jobs run' to execute`);
 			} finally {
 				store.close();

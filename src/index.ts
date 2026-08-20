@@ -5,6 +5,7 @@ import { stopCommand } from "./cli/stop.ts";
 import { statusCommand } from "./cli/status.ts";
 import { jobsCommand } from "./cli/jobs.ts";
 import { runPromptCommand } from "./cli/run-prompt.ts";
+import { serviceCommand } from "./cli/service.ts";
 
 const program = new Command();
 program
@@ -17,6 +18,7 @@ program.addCommand(stopCommand());
 program.addCommand(statusCommand());
 program.addCommand(jobsCommand());
 program.addCommand(runPromptCommand());
+program.addCommand(serviceCommand());
 
 program.parseAsync(process.argv).catch((err: unknown) => {
 	const message = err instanceof Error ? err.message : String(err);

@@ -42,6 +42,8 @@ export class DefaultExecutor implements Executor {
   }
 
   private async runAgent(job: Job, ttlMs: number | undefined): Promise<RunResult> {
+    const modelError = invalidModelError(job.action.model);
+    if (modelError) return { ok: false, output: "", error: modelError };
     return raceTimeout(
       this.deps.runner.run(job.action.prompt ?? "", {
         model: job.action.model,
@@ -131,6 +133,8 @@ export class DefaultExecutor implements Executor {
     if (wake === false && output.trim() === "") {
       return { ok: true, output, exitCode: 0, meta: { wokeAgent: false } };
     }
+    const modelError = invalidModelError(job.action.model);
+    if (modelError) return { ok: false, output, error: modelError };
     const result = await raceTimeout(
       this.deps.runner.run(wakePrompt(output), { model: job.action.model, cwd: job.workdir, timeoutMs: ttlMs }),
       ttlMs,
@@ -155,6 +159,35 @@ function isScriptPath(script: string): boolean {
   return (
     /\.(ts|mts|cts|js|mjs|cjs|tsx|jsx)$/i.test(trimmed) || existsSync(trimmed)
   );
+}
+
+/**
+ * 模型 pin 校验（fail-closed，docs/02-contracts.md §6.4）：格式明显非法时不静默回退，
+ * 直接返回错误（不调 runner）。合法形式：含 "/" 的 provider/model，或已知别名前缀。
+ * 缺省/空串 → null（视为未 pin）。
+ */
+const MODEL_ALIASES = [
+  "claude",
+  "opus",
+  "sonnet",
+  "haiku",
+  "gpt",
+  "o1",
+  "o3",
+  "deepseek",
+  "glm",
+  "qwen",
+  "kimi",
+  "grok",
+] as const;
+
+function invalidModelError(model: string | undefined): string | null {
+  if (model === undefined || model.trim() === "") return null;
+  const t = model.trim();
+  if (t.includes("/")) return null; // provider/model 形式视为合法
+  const lower = t.toLowerCase();
+  if (MODEL_ALIASES.some((a) => lower.startsWith(a))) return null; // 别名前缀匹配
+  return "invalid model";
 }
 
 /** 超时竞速：timeoutMs 缺省/非正数时直通；超时触发 onTimeout 并抛 TimeoutError。 */
