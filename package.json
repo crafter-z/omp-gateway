@@ -1,0 +1,25 @@
+{
+  "name": "omp-gateway",
+  "version": "0.1.0",
+  "description": "Resident gateway daemon for omp: cron scheduler + official QQ Bot API v2 gateway, driven by `omp --mode rpc`. Full TypeScript/Bun stack.",
+  "type": "module",
+  "bin": {
+    "omp-gateway": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build --compile src/index.ts --outfile dist/omp-gateway"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "croner": "^9.0.0",
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}

@@ -93,5 +93,6 @@
 - **QQ 官方 API 变化**：沙箱/正式环境差异、Markdown 审核 → 实现期以
   `bot.q.qq.com/wiki` 为准，配置里保留 `portal_host` 切换。
 - **Windows 进程守护**：P8 前用 CLI 前台 + 计划任务兜底。
-- **omp RPC 协议演进**：以 `docs/rpc.md` 为准，客户端实现集中在 `src/omp/`，协议变化
-  影响面可控。
+- **omp RPC 协议演进**：协议权威源是安装包内
+  `@oh-my-pi/pi-coding-agent/src/modes/rpc/{rpc-client,rpc-frame,rpc-types,rpc-messages}.ts`
+  （安装包无 docs/）；客户端实现集中在 `src/omp/`，协议变化影响面可控。

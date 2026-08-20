@@ -175,8 +175,13 @@ type AgentEvent =
   | { kind: "tool"; name: string; args: unknown }
   | { kind: "error"; message: string };
 class OmpRpcClient {
-  constructor(opts: OmpClientOpts);   // binary/sessionPath?/cwd/model/thinking/approval/extraArgs/timeoutMs
-  async connect(): Promise<void>;     // spawn + 握手（v1/v2 协商）
+  constructor(opts: OmpClientOpts);
+  // OmpClientOpts: { cliPath, cwd, model, thinking, approval, extraArgs, timeoutMs, env? }
+  // cliPath 解析策略（对应 02 §5.1）：
+  //   1) PATH 中的 `omp`：spawn(["bun", "omp", "--mode", "rpc", ...])
+  //   2) 包内 cli.js：spawn(["bun", <abs>/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js, "--mode", "rpc", ...])
+  //   默认：PATH `omp`；P8 服务化须显式传绝对 cliPath（PATH 可能被剥离）
+  async connect(): Promise<void>;     // spawn + ready 握手 + v2 协商（v1 兜底）
   prompt(req: { message: string; images?: string[] }): AsyncIterable<AgentEvent>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
@@ -184,7 +189,7 @@ class OmpRpcClient {
   setModel(provider: string, modelId: string): Promise<void>;
   setThinkingLevel(level: string): Promise<void>;
   setHostTools(defs: HostToolDef[]): Promise<void>;
-  close(): Promise<void>;             // 优雅关闭 + 孤儿进程回收
+  close(): Promise<void>;             // 优雅关闭 + 孤儿进程回收（Windows: taskkill /T /F 兜底）
 }
 
 // ---- qq ----
@@ -328,7 +333,7 @@ interface Delivery {
 |---|---|---|---|
 | D1 | NL 解析 | 自建关键词映射（中英文），croner 校验 | 输入形态超出映射表容忍度时评估 nl2cron |
 | D2 | QQ 客户端 | 自建（Bun 原生 WS/fetch） | 官方 API 出现签名/协议复杂化，评估 @qq/qq-bot-sdk |
-| D3 | rpc 协议版本 | v2 优先，v1 兜底 | 实际 omp 版本行为与 docs/rpc.md 不符时以实测为准并回写文档 |
+| D3 | rpc 协议版本 | v2 优先，v1 兜底；权威源 = 安装包 `src/modes/rpc/*.ts`（无 docs/） | 实际 omp 版本行为与源码不符时以实测为准并回写文档 |
 | D4 | Windows 后台 | pid 文件 + `taskkill /T` | 不稳定则提前 sc/NSSM（P8 内容前移） |
 | D5 | 流式转发 | 缓冲分段发送 | 若 QQ 对逐 token 消息限流明显，改为最终结果一次性发送（保留流式日志） |
 

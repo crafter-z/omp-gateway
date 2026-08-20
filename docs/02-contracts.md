@@ -5,7 +5,9 @@
 
 ## 1. 配置 Schema（config.yml）
 
-单文件 `~/.omp-gateway/config.yml`，zod 校验。环境变量以 `OMP_GATEWAY_` 前缀覆盖。
+单文件 `~/.omp-gateway/config.yml`，zod 校验。环境变量以 `OMP_GATEWAY_` 前缀覆盖：
+层级用**双下划线**分隔、字段名单下划线保留，如 `OMP_GATEWAY_QQ__APP_ID` → `qq.app_id`、
+`OMP_GATEWAY_TIMEZONE` → 顶层 `timezone`；叶值先按 JSON 解析，失败留字符串。
 
 ```yaml
 # --- 全局 ---
@@ -177,17 +179,30 @@ interface Execution {
 ## 5. omp 驱动协议（OmpRpcClient）
 
 ### 5.1 子进程生命周期
-- `spawn(omp, ["--mode", "rpc", ...omp.extra_args])`，cwd = job workdir 或全局配置 cwd
-- 读 stdout JSONL：`ready` 帧 → 协商 v2 → 命令/事件流
+- spawn 方式（对齐官方 `RpcClient.start()`，见 `rpc-client.ts`）：
+  `ptree.spawn(["bun", cliPath, "--mode", "rpc", ...omp.extra_args])`，cwd = job workdir 或全局配置 cwd
+- **cliPath 两种解析策略**：
+  - `PATH` 中的 `omp`（`omp --mode rpc`，用户安装的全局可执行）
+  - 包内 CLI 入口：`node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js` + `bun` 解释器
+    （官方默认 `cliPath ?? "dist/cli.js"` 是相对 cwd 的搜索）
+  - ⚠️ P8 服务化（sc/NSSM）时子进程可能被剥离 PATH，此时必须用**绝对 cliPath**，
+    M1 冒烟测试即钉死此策略
+- 读 stdout JSONL：`ready` 帧（含 `supportedProtocolVersions`/`maxFrameBytes`）→
+  支持 v2 则发 `negotiate_protocol { protocolVersion: 2 }` 并确认响应 → 命令/事件流
 - 会话策略：
   - cron job：`--no-session`（每 job 全新）
   - QQ chat：按 `chat_key` 映射 session 文件，`new_session(parent)` 或复用
 - 超时/崩溃：`omp.rpc_timeout_ms` 中止；子进程退出码非 0 → 标记 execution unknown 并重试策略
 
-### 5.2 命令面（对齐 docs/rpc.md）
-- `prompt { message, images?, streamingBehavior? }`
-- `steer` / `follow_up` / `abort` / `abort_and_prompt`
-- `set_model { provider, modelId }`、`set_thinking_level`
+### 5.2 命令面（协议权威源：`@oh-my-pi/pi-coding-agent/src/modes/rpc/`
+`rpc-client.ts` / `rpc-frame.ts` / `rpc-types.ts` / `rpc-messages.ts`，安装包内无 docs/）
+- 帧编码：JSONL，`encodeRpcFrame`（v1 单帧 ≤1MB；v2 压缩 + `rpc_chunk` 分块，重组上限 64MB）
+- 命令（`RpcCommand`）：`prompt { message, images?, streamingBehavior? }` /
+  `steer` / `follow_up` / `abort` / `abort_and_prompt` / `new_session { parentSession? }`
+- 配置：`set_model { provider, modelId }`、`set_thinking_level { level }`、
+  `set_host_tools { tools }`、`set_todos { phases }`
+- 事件：`agent_start/end`（`isTerminal` 判定完成）、`turn_start/end`、
+  `message_start/update/end`（text_delta 逐 token）、`tool_execution_*`
 - `set_host_tools`（注册宿主工具，如 `qq_send`、`task_status`）
 - `get_state`、`get_last_assistant_text`
 
