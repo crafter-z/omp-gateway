@@ -97,20 +97,3 @@ bun test
   daemon into live TUI sessions (message injection, `/gateway` commands, `qq_send` tool)
 
 See `docs/01-architecture.md` for details.
-
-## Development
-
-Requires Bun 1.3.14+ (omp) and Node/Bun toolchain.
-
-```bash
-bun install
-bun test
-```
-
-## Docs
-
-- `docs/01-architecture.md` — process model, module boundaries, data flow
-- `docs/02-contracts.md` — config schema, job model, execution ledger, IPC protocol
-- `docs/03-capability-gap.md` — hermes capability baseline vs. this project
-- `docs/04-roadmap.md` — phased implementation plan
-- `docs/05-implementation-plan.md` — concrete implementation plan: stack, file tree, type skeleton, per-phase steps
