@@ -11,6 +11,7 @@
  * http://127.0.0.1:18765) and OMP_GATEWAY_ADMIN_TOKEN.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { parseSchedule } from "../scheduler/nl.ts";
 
 interface AdminEvent {
 	type: string;
@@ -76,27 +77,38 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- qq_send tool: agent sends a QQ message via the daemon ----
+	// ---- qq_send tool: agent sends a QQ message (text or MEDIA:<path>) via the daemon ----
 	pi.registerTool({
 		name: "qq_send",
 		label: "QQ Send",
-		description: "通过 omp-gateway 向 QQ 会话发送文本消息。chatKey 格式：c2c:<openid>（私聊）或 group:<group_openid>（群）。",
+		description:
+			"通过 omp-gateway 向 QQ 会话发送消息。chatKey 格式：c2c:<openid>（私聊）、group:<group_openid>（群）或 guild:<channel_id>（频道）。" +
+			"文本消息直接传 text；发送本地文件/图片时传 media=<文件路径>（扩展名判定图片/文件）。",
 		parameters: z.object({
-			chatKey: z.string().describe("目标 chatKey，如 c2c:xxx 或 group:xxx"),
-			text: z.string().describe("消息文本"),
+			chatKey: z.string().describe("目标 chatKey，如 c2c:xxx / group:xxx / guild:xxx"),
+			text: z.string().optional().describe("消息文本（与 media 二选一）"),
+			media: z.string().optional().describe("本地文件路径（与 text 二选一；png/jpg/gif/webp 按图片发送）"),
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { chatKey: string; text: string },
+			params: { chatKey: string; text?: string; media?: string },
 			_onUpdate: unknown,
 			_ctx: unknown,
 			_signal: unknown,
 		) {
-			const { chatKey, text } = params;
+			const { chatKey, text, media } = params;
+			if (media && media.trim() !== "") {
+				await api("/api/outbound/qq", { method: "POST", body: JSON.stringify({ chatKey, media }) });
+				return {
+					content: [{ type: "text", text: `QQ 媒体已发送到 ${chatKey}` }],
+					details: { chatKey, media: true },
+				};
+			}
+			if (!text) throw new Error("qq_send 需要 text 或 media 之一");
 			await api("/api/outbound/qq", { method: "POST", body: JSON.stringify({ chatKey, text }) });
 			return {
 				content: [{ type: "text", text: `QQ 消息已发送到 ${chatKey}` }],
-				details: { chatKey },
+				details: { chatKey, media: false },
 			};
 		},
 	});
@@ -106,7 +118,9 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 		name: "job_add",
 		label: "Job Add",
 		description:
-			"创建 omp-gateway 定时任务。仅支持 no-agent 类型（执行脚本），agent 创建的 job 不允许再创建调度任务（防死循环）。schedule: interval 如 \"5m\"、cron 6 字段、once \"+30m\"。",
+			"创建 omp-gateway 定时任务。仅支持 no-agent 类型（执行脚本），agent 创建的 job 不允许再创建调度任务（防死循环）。" +
+			"schedule 支持自然语言与表达式：\"5m\" / \"every 5 minutes\" / \"每天 9 点\" / \"every sunday 9am\" / " +
+			"cron 6 字段 \"0 0 9 * * *\" / once \"+30m\" 或 ISO 时间戳。",
 		parameters: z.object({
 			name: z.string().describe("唯一 job 名"),
 			schedule: z.string().describe('调度：interval "5m" / cron "0 0 9 * * *" / once "+30m"'),
@@ -122,16 +136,19 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 			_signal: unknown,
 		) {
 			const { name, schedule, script, delivery_target, file } = params;
-			// 简单调度表达式判定：纯数字+单位 → interval；数字开头带空格单位 → interval；否则 cron
-			let kind: "interval" | "cron" | "once" = "cron";
-			const trimmed = schedule.trim();
-			if (/^\d+(s|m|h|d)$/i.test(trimmed) || /^every\s/i.test(trimmed) || /^每\s/i.test(trimmed)) kind = "interval";
-			else if (trimmed.startsWith("+")) kind = "once";
+			// 与 CLI --schedule 同一解析器：NL/interval/cron/once 全支持；失败明确报错给 agent
+			const parsed = parseSchedule(schedule);
+			if (!parsed) {
+				throw new Error(
+					`无法解析调度表达式 "${schedule}"。支持："5m"、"every 5 minutes"、"每天 9 点"、` +
+						`"every sunday 9am"、6 字段 cron "0 0 9 * * *"、once "+30m" 或 ISO 时间戳`,
+				);
+			}
 			const job = await api<Record<string, unknown>>("/api/jobs", {
 				method: "POST",
 				body: JSON.stringify({
 					name,
-					schedule: { kind, expr: trimmed },
+					schedule: parsed,
 					action: { type: "no-agent", script, wake_agent: false },
 					delivery: { target: delivery_target, file },
 					meta: { source: "agent" },

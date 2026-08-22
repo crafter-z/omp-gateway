@@ -26,8 +26,18 @@ export const qqConfigSchema = z.object({
 	app_id: z.string().min(1, "qq.app_id is required"),
 	app_secret: z.string().min(1, "qq.app_secret is required"),
 	portal_host: z.string().default("q.qq.com"),
+	/** WebSocket gateway URL override (empty = derive from portal host). Test/sandbox hook. */
+	ws_url: z.string().default(""),
 	intents: z
-		.array(z.enum(["C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "PUBLIC_GUILD_MESSAGES"]))
+		.array(
+			z.enum([
+				"C2C_MESSAGE_CREATE",
+				"GROUP_AT_MESSAGE_CREATE",
+				"PUBLIC_GUILD_MESSAGES",
+				"DIRECT_MESSAGE_CREATE",
+				"INTERACTION_CREATE",
+			]),
+		)
 		.default(["C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"]),
 	allow: z
 		.object({
@@ -38,6 +48,8 @@ export const qqConfigSchema = z.object({
 		.default({}),
 	stt: qqSttConfigSchema.default({}),
 	markdown_support: z.boolean().default(false),
+	/** C2C 消息处理期间发送"正在输入"指示（input_notify，50s debounce）。 */
+	typing_indicator: z.boolean().default(true),
 });
 
 export const ompConfigSchema = z.object({
@@ -65,6 +77,12 @@ export const schedulerConfigSchema = z.object({
 	misfire_grace_s: z.number().int().min(0).default(300),
 	nudge_after_failures: z.number().int().min(1).default(3),
 	ledger: z.string().default("~/.omp-gateway/ledger.db"),
+	/** liveness 信号目录（ticker_heartbeat/last_success/last_error）；空 = 关闭。 */
+	liveness_dir: z.string().default(""),
+	/** 已完成的 once job 留存天数（0 = 不清理）。 */
+	completed_once_retention_days: z.number().int().min(0).default(7),
+	/** 每个 job 的输出文件留存上限（0 = 不清理）。 */
+	output_retention: z.number().int().min(0).default(50),
 });
 
 export const deliveryConfigSchema = z.object({
@@ -72,6 +90,16 @@ export const deliveryConfigSchema = z.object({
 	home_channel: z.string().default(""),
 	wrap_response: z.boolean().default(true),
 	silent_trigger: z.string().default("[SILENT]"),
+	/** 投递前过滤 LLM 幻觉的静音叙述 token（*(silent)* / 🔇 / 裸 "." / "…"）。 */
+	filter_silence_narration: z.boolean().default(true),
+	/**
+	 * QQ 回复流式投递（contract 02 §5.3）：text_delta 按边界缓冲到
+	 * stream_chunk_chars 即发一条（msg_seq 递增），agent_end 后发余量。
+	 * 官方 API 无消息编辑能力，"流式"即多条顺序发送；默认关（一次性投递）。
+	 */
+	stream_replies: z.boolean().default(false),
+	/** 流式分块的目标字符数（在边界字符处切）。 */
+	stream_chunk_chars: z.number().int().min(50).max(2000).default(300),
 });
 
 export const gatewayConfigSchema = z.object({

@@ -78,7 +78,8 @@ export function jobsCommand(): Command {
 		.option("--prompt <text>", "agent prompt")
 		.option("--script <path>", "no-agent script file path")
 		.option("--model <model>", "per-job model pin")
-		.option("--target <file|qq|origin>", "delivery target", "qq")
+		.option("--context-from <names>", "comma-separated job names whose latest output is injected as prompt context")
+		.option("--target <targets>", "delivery target(s): file|qq|origin|all or chatKeys (comma-separated)", "qq")
 		.option("--file <path>", "output file for target=file")
 		.option("--qq-chat <chatKey>", "explicit qq target (default: home channel)")
 		.option("--silent", "suppress delivery")
@@ -98,6 +99,9 @@ export function jobsCommand(): Command {
 							type: "agent" as const,
 							prompt: opts.prompt,
 							model: opts.model,
+							context_from: opts.contextFrom
+								? String(opts.contextFrom).split(",").map((s) => s.trim()).filter(Boolean)
+								: undefined,
 						}
 					: {
 							type: "no-agent" as const,

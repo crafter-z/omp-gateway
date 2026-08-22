@@ -11,6 +11,9 @@ export interface AdminStatus {
 	scheduler: "running" | "stopped";
 	runningJobs: number;
 	jobs: number;
+	lastTickAt?: string;
+	lastSuccessAt?: string;
+	lastErrorAt?: string;
 }
 
 export interface AdminJob {
@@ -36,13 +39,20 @@ export interface AdminJobInput {
 	name: string;
 	enabled?: boolean;
 	schedule: { kind: "cron" | "interval" | "once"; expr: string; repeat?: number };
-	action: { type: "agent" | "no-agent"; prompt?: string; model?: string; script?: string; wake_agent?: boolean };
-	delivery: { target: "file" | "qq" | "origin"; file?: string; qq_chat?: string; silent?: boolean };
+	action: { type: "agent" | "no-agent"; prompt?: string; model?: string; script?: string; wake_agent?: boolean; context_from?: string[] };
+	delivery: { target: string; file?: string; qq_chat?: string; silent?: boolean };
 	workdir?: string;
 	max_runs?: number;
 	ttl_s?: number;
 	/** job 创建来源标记（防死循环：agent 创建的调度 job 受限） */
 	meta?: { source?: "agent" | "cli" };
+}
+
+export interface AdminDeadTarget {
+	chatKey: string;
+	errorKind: string;
+	markedAt: string;
+	lastError: string | null;
 }
 
 export interface AdminContext {
@@ -53,6 +63,9 @@ export interface AdminContext {
 	removeJob(id: string): void;
 	syncJob(id: string): void;
 	sendQq(chatKey: string, text: string): Promise<void>;
+	sendQqMedia(chatKey: string, filePath: string): Promise<void>;
+	deadTargets(): AdminDeadTarget[];
+	clearDeadTarget(chatKey: string): void;
 	subscribe(listener: (e: AdminEvent) => void): () => void;
 	emit(event: AdminEvent): void;
 }
@@ -155,9 +168,16 @@ export class AdminServer {
 					return methodNotAllowed();
 				case "/api/outbound/qq":
 					if (req.method === "POST") {
-						const body = (await req.json()) as { chatKey: string; text: string };
-						if (typeof body.chatKey !== "string" || typeof body.text !== "string") {
-							return json({ error: "chatKey and text required" }, 400);
+						const body = (await req.json()) as { chatKey: string; text: string; media?: string };
+						if (typeof body.chatKey !== "string") {
+							return json({ error: "chatKey required" }, 400);
+						}
+						if (typeof body.media === "string" && body.media.trim() !== "") {
+							await this.ctx.sendQqMedia(body.chatKey, body.media);
+							return json({ ok: true, media: true });
+						}
+						if (typeof body.text !== "string") {
+							return json({ error: "text required" }, 400);
 						}
 						await this.ctx.sendQq(body.chatKey, body.text);
 						return json({ ok: true });
@@ -178,6 +198,15 @@ export class AdminServer {
 					return json({ ok: true });
 				}
 				return methodNotAllowed();
+			}
+			if (url.pathname === "/api/dead-targets") {
+				if (req.method === "GET") return json(this.ctx.deadTargets());
+				return methodNotAllowed();
+			}
+			const deadMatch = /^\/api\/dead-targets\/([^/]+)$/.exec(url.pathname);
+			if (deadMatch && req.method === "DELETE") {
+				this.ctx.clearDeadTarget(decodeURIComponent(deadMatch[1]!));
+				return json({ ok: true });
 			}
 			return json({ error: `not found: ${url.pathname}` }, 404);
 		} catch (err) {
