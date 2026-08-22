@@ -114,49 +114,67 @@ export class Ledger {
     return execution;
   }
 
-  /** claimed → running，记 started_at。 */
-  markRunning(id: string): void {
-    this.store.db
-      .query("UPDATE executions SET status = 'running', started_at = ? WHERE id = ?")
+  /**
+   * claimed → running，记 started_at。返回 false 表示该 execution 已不处于
+   * claimed（如已被 scanStale 置 unknown）——调用方应放弃后续终态写入。
+   */
+  markRunning(id: string): boolean {
+    const changes = this.store.db
+      .query("UPDATE executions SET status = 'running', started_at = ? WHERE id = ? AND status = 'claimed'")
       .run(new Date().toISOString(), id);
+    return changes.changes > 0;
   }
 
-  /** running → completed。同步回写 jobs：last_run / run_count+1 / fail_streak=0 / status。 */
-  markCompleted(id: string, outputRef: string | null, meta?: Record<string, unknown>): void {
+  /**
+   * running → completed。同步回写 jobs：last_run / run_count+1 / fail_streak=0 / status。
+   * 带状态守卫：仅当 execution 仍是 claimed/running 时生效——防止 scanStale 已把
+   * 长时间运行标为 unknown 后，迟到的完成写入污染台账历史。
+   */
+  markCompleted(id: string, outputRef: string | null, meta?: Record<string, unknown>): boolean {
     const row = this.getRow(id);
     if (!row) throw new Error(`execution not found: ${id}`);
     const now = new Date().toISOString();
-    this.store.db
+    const changes = this.store.db
       .query(
-        "UPDATE executions SET status='completed', finished_at=?, output_ref=?, exit_code=0, error=NULL, meta=? WHERE id=?",
+        "UPDATE executions SET status='completed', finished_at=?, output_ref=?, exit_code=0, error=NULL, meta=? WHERE id=? AND status IN ('claimed','running')",
       )
       .run(now, outputRef, JSON.stringify(meta ?? {}), id);
+    if (changes.changes === 0) return false;
     this.syncJobAfterFinish(row.job_id, "completed", now);
+    return true;
   }
 
-  /** running → failed。同步回写 jobs：last_run / run_count+1 / fail_streak+1 / status。 */
-  markFailed(id: string, error: string, exitCode?: number | null, meta?: Record<string, unknown>): void {
+  /** running → failed。同步回写 jobs：last_run / run_count+1 / fail_streak+1 / status。同 markCompleted 带守卫。 */
+  markFailed(id: string, error: string, exitCode?: number | null, meta?: Record<string, unknown>): boolean {
     const row = this.getRow(id);
     if (!row) throw new Error(`execution not found: ${id}`);
     const now = new Date().toISOString();
-    this.store.db
+    const changes = this.store.db
       .query(
-        "UPDATE executions SET status='failed', finished_at=?, error=?, exit_code=?, meta=? WHERE id=?",
+        "UPDATE executions SET status='failed', finished_at=?, error=?, exit_code=?, meta=? WHERE id=? AND status IN ('claimed','running')",
       )
       .run(now, error, exitCode ?? null, JSON.stringify(meta ?? {}), id);
+    if (changes.changes === 0) return false;
     this.syncJobAfterFinish(row.job_id, "failed", now);
+    return true;
   }
 
-  /** 超时/崩溃 → unknown；把 jobs.status 复位为 idle/disabled（不动 last_run/run_count/fail_streak）。 */
+  /**
+   * 超时/崩溃 → unknown；把 jobs.status 复位为 idle/disabled（不动 last_run/run_count/fail_streak）。
+   * 带状态守卫：仅 claimed/running 会被置 unknown；job 状态复位仅在没有其他
+   * 占用中的 execution 时执行（防止复位并发新 claim 的 running 状态）。
+   */
   markUnknown(id: string, error: string | null = null): Execution | null {
     const row = this.getRow(id);
     if (!row) return null;
+    if (row.status !== "claimed" && row.status !== "running") return null;
     const now = new Date().toISOString();
-    this.store.db
-      .query("UPDATE executions SET status='unknown', finished_at=?, error=? WHERE id=?")
+    const changes = this.store.db
+      .query("UPDATE executions SET status='unknown', finished_at=?, error=? WHERE id=? AND status IN ('claimed','running')")
       .run(now, error, id);
+    if (changes.changes === 0) return null;
     const job = this.store.get(row.job_id);
-    if (job) {
+    if (job && job.status === "running" && !this.hasOccupyingExecution(row.job_id)) {
       this.store.update(row.job_id, { status: job.enabled ? "idle" : "disabled" });
     }
     return { ...rowToExecution(row), status: "unknown", finished_at: now, error };
@@ -193,6 +211,15 @@ export class Ledger {
       run_count: job.run_count + 1,
       fail_streak: outcome === "completed" ? 0 : job.fail_streak + 1,
     });
+  }
+  /** 该 job 是否仍存在占用中的 execution（claimed/running）。 */
+  private hasOccupyingExecution(jobId: string): boolean {
+    const row = this.store.db
+      .query<{ n: number }, SQLQueryBindings[]>(
+        "SELECT COUNT(*) AS n FROM executions WHERE job_id = ? AND status IN ('claimed','running')",
+      )
+      .get(jobId)!;
+    return row.n > 0;
   }
 
   private getRow(id: string): ExecRow | null {

@@ -24,11 +24,12 @@ interface JobRow {
   last_run: string | null;
   run_count: number;
   fail_streak: number;
+  meta: string;
   created_at: string;
   updated_at: string;
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export class JobStore {
   /** 对外暴露的 db 句柄：ledger（executions）与 chat 模块（chat_sessions）复用同一连接 */
@@ -48,14 +49,33 @@ export class JobStore {
     this.db.close();
   }
 
-  /** 迁移：user_version < 1 → 建三表并置版本。幂等（IF NOT EXISTS + 版本号）。 */
+  /**
+   * 迁移（幂等，按 user_version 分步）：
+   * v0→1：建 jobs / executions / chat_sessions 三表 + 索引；
+   * v1→2：jobs 增加 meta 列（JSON，记录创建来源等；anti-loop 防绕过依赖它）。
+   */
   private migrate(): void {
     const current = this.db
       .query<{ user_version: number }, SQLQueryBindings[]>("PRAGMA user_version")
       .get()!.user_version;
     if (current >= SCHEMA_VERSION) return;
     this.db.transaction(() => {
-      this.db.run(`
+      if (current < 1) {
+        this.createV1Tables();
+      }
+      if (current < 2) {
+        // 已有 v1 库可能已手工加过该列（防御性）：查列存在性
+        const cols = this.db.query<{ name: string }, SQLQueryBindings[]>("PRAGMA table_info(jobs)").all();
+        if (!cols.some((c) => c.name === "meta")) {
+          this.db.run("ALTER TABLE jobs ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'");
+        }
+      }
+      this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    })();
+  }
+
+  private createV1Tables(): void {
+    this.db.run(`
         CREATE TABLE IF NOT EXISTS jobs (
           id         TEXT PRIMARY KEY,
           name       TEXT NOT NULL UNIQUE,
@@ -75,7 +95,7 @@ export class JobStore {
           updated_at TEXT NOT NULL
         )
       `);
-      this.db.run(`
+    this.db.run(`
         CREATE TABLE IF NOT EXISTS executions (
           id           TEXT PRIMARY KEY,
           job_id       TEXT NOT NULL,
@@ -92,10 +112,10 @@ export class JobStore {
           FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )
       `);
-      this.db.run(
-        "CREATE INDEX IF NOT EXISTS idx_executions_job_status ON executions(job_id, status)",
-      );
-      this.db.run(`
+    this.db.run(
+      "CREATE INDEX IF NOT EXISTS idx_executions_job_status ON executions(job_id, status)",
+    );
+    this.db.run(`
         CREATE TABLE IF NOT EXISTS chat_sessions (
           chat_key       TEXT PRIMARY KEY,
           session_path   TEXT NOT NULL,
@@ -103,8 +123,6 @@ export class JobStore {
           last_active_at TEXT NOT NULL
         )
       `);
-      this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    })();
   }
 
   list(): Job[] {
@@ -147,14 +165,15 @@ export class JobStore {
       last_run: null,
       run_count: 0,
       fail_streak: 0,
+      meta: input.meta ?? {},
       created_at: now,
       updated_at: now,
     };
     this.db
       .query(
         `INSERT INTO jobs (id, name, enabled, schedule, action, delivery, workdir, max_runs, ttl_s,
-                           status, next_run, last_run, run_count, fail_streak, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           status, next_run, last_run, run_count, fail_streak, meta, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         job.id,
@@ -171,6 +190,7 @@ export class JobStore {
         job.last_run,
         job.run_count,
         job.fail_streak,
+        JSON.stringify(job.meta),
         job.created_at,
         job.updated_at,
       );
@@ -190,7 +210,7 @@ export class JobStore {
     this.db
       .query(
         `UPDATE jobs SET name=?, enabled=?, schedule=?, action=?, delivery=?, workdir=?, max_runs=?, ttl_s=?,
-                         status=?, next_run=?, last_run=?, run_count=?, fail_streak=?, updated_at=?
+                         status=?, next_run=?, last_run=?, run_count=?, fail_streak=?, meta=?, updated_at=?
          WHERE id=?`,
       )
       .run(
@@ -207,6 +227,7 @@ export class JobStore {
         merged.last_run,
         merged.run_count,
         merged.fail_streak,
+        JSON.stringify(merged.meta ?? {}),
         merged.updated_at,
         merged.id,
       );
@@ -257,6 +278,7 @@ function rowToJob(row: JobRow): Job {
     last_run: row.last_run ?? null,
     run_count: row.run_count,
     fail_streak: row.fail_streak,
+    meta: JSON.parse(row.meta ?? "{}"),
     created_at: row.created_at,
     updated_at: row.updated_at,
   };

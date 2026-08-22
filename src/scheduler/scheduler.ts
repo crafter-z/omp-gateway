@@ -4,14 +4,19 @@
  * 周期 tick 扫描超时台账（→ unknown），并在 misfireGraceS 宽限窗口内对
  * enabled 且未在跑的 job 补跑一次（P5）。
  *
- * M1 依赖说明：模块间零文件共享，故内部自带轻量日志（console.error），
- * daemon 接线时可替换为 util/logger。
+ * 启动时对"宕机期间错过"的 once job 补救：目标时间落在宽限窗口内 → 立即补跑；
+ * 超出窗口 → next_run 清空并记日志（明确死亡，不再静默悬挂）。
+ *
+ * 日志：默认 console.error，可经 opts.log 注入（daemon 接线为 util/logger）。
  */
+import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Cron } from "croner";
 import type { Job, RunResult } from "./types.ts";
 import type { JobStore } from "./store.ts";
 import { Ledger } from "./ledger.ts";
 import type { Executor } from "./executor.ts";
+import { intervalToCron, onceDate } from "./expr.ts";
 
 export interface SchedulerOptions {
   /** croner 求值时区（IANA，如 Asia/Shanghai） */
@@ -24,7 +29,19 @@ export interface SchedulerOptions {
   misfireGraceS: number;
   /** 执行完成回调（daemon 投递 hook）。result 为 executor 原始产出，job 为触发时的快照。 */
   onResult?: (job: Job, result: RunResult) => void;
+  /** 日志注入（缺省 console.error）。 */
+  log?: (message: string) => void;
+  /** liveness 信号目录（hermes ticker_heartbeat/last_success/last_error 对等）；空 = 关闭。 */
+  livenessDir?: string;
+  /** 输出审计目录（daemon 传 dirname(ledger)/outputs）；空 = 关闭输出裁剪。 */
+  outputsDir?: string;
+  /** 已完成的 once job 留存天数（超过则清理）；0 = 关闭。 */
+  completedOnceRetentionDays?: number;
+  /** 每个 job 的 output 文件留存上限（默认 50）；0 = 关闭。 */
+  outputRetention?: number;
 }
+
+const MAX_TERMINAL_EXECUTIONS = 1000;
 
 export class Scheduler {
   private readonly ledger: Ledger;
@@ -56,11 +73,40 @@ export class Scheduler {
         this.log(`skip scheduling job ${job.id} (${job.name}): status running, awaiting scanStale recovery`);
         continue;
       }
+      if (this.catchUpMissedOnce(job)) continue; // 已补跑或已宣告死亡，不再注册
       this.register(job);
     }
     this.tickHandle = setInterval(() => {
       void this.onTick();
     }, this.opts.tickS * 1000);
+  }
+
+  /**
+   * 宕机期间错过的 once job 补救（misfire catch-up 覆盖不到"从未触发"的 job）：
+   * - 目标时间在宽限窗口内 → 立即补跑一次（走 fire 的 claim/台账/投递全链路），返回 true；
+   * - 目标时间已过且超出窗口 → next_run 清空 + 日志，明确死亡而非静默悬挂，返回 true；
+   * - 未来时间或非 once → false（正常注册流程）。
+   */
+  private catchUpMissedOnce(job: Job): boolean {
+    if (job.schedule.kind !== "once") return false;
+    const target = onceDate(job.schedule.expr);
+    if (!target || target.getTime() > Date.now()) return false;
+    const missedByMs = Date.now() - target.getTime();
+    if (missedByMs <= this.opts.misfireGraceS * 1000) {
+      this.log(
+        `once job ${job.id} (${job.name}) missed while down ${Math.round(missedByMs / 1000)}s ago — firing now`,
+      );
+      void this.fire(job.id).then(() => {
+        // once 补跑后无 croner 注册（register 会跳过已过期 once），直接清 next_run
+        this.store.update(job.id, { next_run: null });
+      });
+      return true;
+    }
+    this.store.update(job.id, { next_run: null });
+    this.log(
+      `once job ${job.id} (${job.name}) expired ${Math.round(missedByMs / 1000)}s ago (beyond grace window) — not firing`,
+    );
+    return true;
   }
 
   /** 停止全部 croner 并清 tick。 */
@@ -97,6 +143,12 @@ export class Scheduler {
           }
           if (target.getTime() <= Date.now()) {
             this.log(`skip job ${job.id} (${job.name}): once time already passed`);
+            return;
+          }
+          // 已完成（run_count 达上限）的 once job 不再重新武装——交给留存清理。
+          if (job.run_count >= (sched.repeat ?? 1)) {
+            this.log(`skip job ${job.id} (${job.name}): once job already completed (${job.run_count} run(s))`);
+            this.store.update(job.id, { next_run: null });
             return;
           }
           pattern = target;
@@ -161,14 +213,19 @@ export class Scheduler {
       this.ledger.markRunning(execution.id);
       const result = await this.executor.execute(job, new Date(execution.scheduled_at));
       if (result.ok) {
-        this.ledger.markCompleted(execution.id, null, result.meta);
+        const outputRef = (result.meta?.output_ref as string | undefined) ?? null;
+        this.ledger.markCompleted(execution.id, outputRef, result.meta);
       } else {
         this.ledger.markFailed(execution.id, result.error ?? "execution failed", result.exitCode ?? null, result.meta);
       }
       this.opts.onResult?.(this.store.get(jobId) ?? job, result);
+      if (result.ok) this.writeLiveness("ticker_last_success", `${job.name} ok`);
+      else this.writeLiveness("ticker_last_error", `${job.name}: ${(result.error ?? "failed").slice(0, 120)}`);
     } catch (e) {
       this.ledger.markFailed(execution.id, e instanceof Error ? e.message : String(e));
-      this.opts.onResult?.(this.store.get(jobId) ?? job, { ok: false, output: "", error: e instanceof Error ? e.message : String(e) });
+      const errText = e instanceof Error ? e.message : String(e);
+      this.opts.onResult?.(this.store.get(jobId) ?? job, { ok: false, output: "", error: errText });
+      this.writeLiveness("ticker_last_error", `${job.name}: ${errText.slice(0, 120)}`);
     } finally {
       this.activeCount -= 1;
       this.inFlight.delete(jobId);
@@ -207,8 +264,12 @@ export class Scheduler {
   /**
    * 周期扫描：超时台账 → unknown；随后对 scheduled_at 落在 misfireGraceS 宽限窗口内、
    * job 仍 enabled 且未在跑的 execution 触发一次补跑（防重复：execution id 记入集合）。
+   * 同时执行维护任务：liveness 心跳、台账/输出清理、once 留存清理。
    */
   private onTick(): void {
+    this.writeLiveness("ticker_heartbeat");
+    // 稳态维护与 misfire 扫描解耦：即使没有超时台账，裁剪/留存也必须每 tick 执行。
+    this.maintain();
     const timeoutMs = this.opts.misfireGraceS * 1000;
     const stale = this.ledger.scanStale(timeoutMs);
     for (const s of stale) {
@@ -234,44 +295,111 @@ export class Scheduler {
     }
   }
 
+  /**
+   * 后台维护（在 tick 中低频执行）：
+   * - executions 终态行裁剪（保留最新 MAX_TERMINAL_EXECUTIONS 行）
+   * - 已完成的 once job 留存清理（completedOnceRetentionDays）
+   * - per-job output 文件留存裁剪（outputRetention）
+   */
+  private maintain(): void {
+    try {
+      this.store.db.run(
+        `DELETE FROM executions WHERE status IN ('completed','failed','unknown')
+           AND id NOT IN (
+             SELECT id FROM executions WHERE status IN ('completed','failed','unknown')
+             ORDER BY finished_at DESC LIMIT ?
+           )`,
+        [MAX_TERMINAL_EXECUTIONS],
+      );
+    } catch (e) {
+      this.log(`execution prune failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const retentionDays = this.opts.completedOnceRetentionDays;
+    if (retentionDays && retentionDays > 0) {
+      const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+      try {
+        for (const job of this.store.list()) {
+          if (job.schedule.kind !== "once") continue;
+          if (job.next_run !== null) continue; // 未触发完成
+          const repeats = job.schedule.repeat ?? 1;
+          if (job.run_count < repeats) continue;
+          // 留存计时以完成时间（last_run）为准——updated_at 会被管理操作刷新。
+          const anchor = job.last_run ?? job.updated_at;
+          if (anchor !== null && anchor < cutoff) {
+            this.log(`removing completed once job ${job.id} (${job.name}) after ${retentionDays}d retention`);
+            this.store.remove(job.id);
+            this.sync(job.id);
+          }
+        }
+      } catch (e) {
+        this.log(`once retention failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    const outputRetention = this.opts.outputRetention ?? 50;
+    if (outputRetention > 0 && this.opts.outputsDir) {
+      try {
+        void pruneOutputs(this.opts.outputsDir, outputRetention);
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  /** 写 liveness 信号文件（ticker_heartbeat / last_success / last_error）。 */
+  private writeLiveness(name: "ticker_heartbeat" | "ticker_last_success" | "ticker_last_error", detail = ""): void {
+    const dir = this.opts.livenessDir;
+    if (!dir) return;
+    try {
+      mkdirSync(dir, { recursive: true });
+      const line = `${new Date().toISOString()} ${detail}`.trim();
+      writeFileSync(join(dir, name), line + "\n");
+    } catch {
+      // best-effort: liveness files never break scheduling
+    }
+  }
+
   private log(message: string): void {
-    // 轻量内部日志（M1），daemon 接线可替换为 util/logger
-    console.error(`[scheduler] ${new Date().toISOString()} ${message}`);
+    const line = `[scheduler] ${new Date().toISOString()} ${message}`;
+    if (this.opts.log) this.opts.log(message);
+    else console.error(line);
   }
 }
 
-/** interval 表达式（"5m"）→ croner 6 字段 cron 表达式 */
-function intervalToCron(expr: string): string {
-  const m = /^(\d+)(s|m|h|d)$/i.exec(expr.trim());
-  if (!m) {
-    throw new Error(`invalid interval expression "${expr}" (expected e.g. 30s, 5m, 2h, 1d)`);
+/** 每个 job 子目录只保留最新的 N 个 output 文件（异步 best-effort）。 */
+async function pruneOutputs(outputsDir: string, keep: number): Promise<void> {
+  let jobDirs: string[];
+  try {
+    jobDirs = readdirSync(outputsDir);
+  } catch {
+    return; // 目录不存在 → 无事可做
   }
-  const n = parseInt(m[1], 10);
-  if (n <= 0) throw new Error(`invalid interval "${expr}": must be positive`);
-  switch (m[2].toLowerCase()) {
-    case "s":
-      return `*/${n} * * * * *`;
-    case "m":
-      return `0 */${n} * * * *`;
-    case "h":
-      return `0 0 */${n} * * *`;
-    case "d":
-      return `0 0 0 */${n} * *`;
-    default:
-      throw new Error(`unsupported interval unit in "${expr}"`);
+  for (const dir of jobDirs) {
+    const full = join(outputsDir, dir);
+    let files: string[];
+    try {
+      const st = statSync(full);
+      if (!st.isDirectory()) continue;
+      files = readdirSync(full);
+    } catch {
+      continue;
+    }
+    const byMtime = files
+      .map((f) => ({ f, path: join(full, f) }))
+      .sort((a, b) => {
+        try {
+          return statSync(b.path).mtimeMs - statSync(a.path).mtimeMs;
+        } catch {
+          return 0;
+        }
+      });
+    for (const { path } of byMtime.slice(keep)) {
+      try {
+        unlinkSync(path);
+      } catch {
+        // best-effort
+      }
+    }
   }
-}
-
-/** once 表达式 → 目标 Date；"+30m" 相对时间或 ISO 时间戳；非法 → null */
-function onceDate(expr: string): Date | null {
-  const trimmed = expr.trim();
-  if (trimmed.startsWith("+")) {
-    const rel = /^(\d+)(s|m|h|d)$/i.exec(trimmed.slice(1).trim());
-    if (!rel) return null;
-    const n = parseInt(rel[1], 10);
-    const unitMs: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
-    return new Date(Date.now() + n * unitMs[rel[2].toLowerCase()]);
-  }
-  const d = new Date(trimmed);
-  return Number.isNaN(d.getTime()) ? null : d;
 }

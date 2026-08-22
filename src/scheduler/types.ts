@@ -28,11 +28,17 @@ export interface JobAction {
   script?: string;
   /** false = 预检门：先跑脚本，仅非空输出时唤醒 agent */
   wake_agent?: boolean;
+  /**
+   * job 链（hermes context_from）：这些 job 名的最新输出会被注入本次
+   * prompt 的上下文。executor 经 deps.lastOutput 取回（读取 output 文件）。
+   */
+  context_from?: string[];
 }
 
 /** 投递目标 */
 export interface JobDelivery {
-  target: "file" | "qq" | "origin";
+  /** "file" | "qq" | "origin" | "all" | 逗号分隔多目标（chatKey + kind 混合） */
+  target: string;
   /** target=file 时的输出路径 */
   file?: string;
   /** target=qq 时的显式目标（缺省 = home channel） */
@@ -42,6 +48,8 @@ export interface JobDelivery {
   continuable?: boolean;
   /** 覆盖全局 wrap_response */
   wrap_response?: boolean;
+  /** 覆盖全局 markdown 开关（false = 发送前 strip markdown） */
+  markdown_support?: boolean;
 }
 
 /** Job 模型（docs/02-contracts.md §2）。运行时字段由 ledger/scheduler 维护。 */
@@ -57,6 +65,9 @@ export interface Job {
   workdir?: string; // 执行目录
   max_runs?: number;
   ttl_s?: number; // 单次执行超时（秒）
+
+  /** 创建来源等元数据（JSON 列；anti-loop：source=agent 的 job 禁止 agent 型 action） */
+  meta?: Record<string, unknown>;
 
   // 运行时状态（由 ledger/executor 维护）
   status: "idle" | "running" | "disabled";
@@ -103,12 +114,18 @@ export interface RunResult {
 
 /**
  * agent 执行器接口。真实实现由 daemon 用 OmpRpcClient 适配（omp 模块），
- * M1 单元测试用 fake。
+ * M1 单元测试用 fake。sessionPath 传入时复用该会话文件（-r），缺省为全新会话。
  */
 export interface AgentRunner {
   run(
     prompt: string,
-    opts: { model?: string; cwd?: string; timeoutMs?: number },
+    opts: {
+      model?: string;
+      cwd?: string;
+      timeoutMs?: number;
+      images?: string[];
+      sessionPath?: string;
+    },
   ): Promise<RunResult>;
 }
 

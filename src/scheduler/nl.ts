@@ -70,6 +70,9 @@ const EN_WEEKDAY: Record<string, number> = {
 const CN_TIME =
   "[0-9一二两三四五六七八九十]+[点时](?:半|[0-9一二两三四五六七八九十]+分)?|中午|午夜|凌晨";
 
+/** interval 单位上限（对齐 scheduler/expr.ts 的 croner 步长限制） */
+const INTERVAL_MAX: Record<string, number> = { s: 59, m: 59, h: 23, d: 31 };
+
 export function parseSchedule(input: string): ParsedSchedule | null {
   if (typeof input !== "string") return null;
   const raw = input.trim();
@@ -79,7 +82,7 @@ export function parseSchedule(input: string): ParsedSchedule | null {
   const bareInterval = /^(\d+)\s*([smhd])$/i.exec(raw);
   if (bareInterval) {
     const n = parseInt(bareInterval[1], 10);
-    if (n <= 0) return null;
+    if (n <= 0 || n > INTERVAL_MAX[bareInterval[2].toLowerCase()]) return null;
     return { kind: "interval", expr: `${n}${bareInterval[2].toLowerCase()}` };
   }
 
@@ -116,8 +119,9 @@ function parseChinese(raw: string): ParsedSchedule | null {
   let m = /^每(?:隔)?([0-9一二两三四五六七八九十]+)(秒|分钟|小时|钟头|天|日)$/.exec(s);
   if (m) {
     const n = cnNum(m[1]!);
-    if (n === null || n <= 0) return null;
-    return { kind: "interval", expr: `${n}${CN_UNIT[m[2]!]!}` };
+    const unit = CN_UNIT[m[2]!];
+    if (n === null || n <= 0 || n > INTERVAL_MAX[unit]) return null;
+    return { kind: "interval", expr: `${n}${unit}` };
   }
 
   // 每半小时 / 每半个钟头
@@ -158,8 +162,9 @@ function parseEnglish(s: string): ParsedSchedule | null {
   let m = /^every\s+(\d+)\s+(second|minute|hour|day)s?$/.exec(s);
   if (m) {
     const n = parseInt(m[1], 10);
-    if (n <= 0) return null;
-    return { kind: "interval", expr: `${n}${EN_UNIT[m[2]!]!}` };
+    const unit = EN_UNIT[m[2]!];
+    if (n <= 0 || n > INTERVAL_MAX[unit]) return null;
+    return { kind: "interval", expr: `${n}${unit}` };
   }
 
   // every hour / every minute / every day
