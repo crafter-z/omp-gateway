@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { unlinkSync } from "node:fs";
+import { join } from "node:path";
 import { loadConfig, applyEnvOverrides, expandHome, ConfigError } from "../../src/config/load.ts";
 import { resolveSecret, resolveSecretsDeep } from "../../src/config/secret.ts";
 import { gatewayConfigSchema } from "../../src/config/schema.ts";
@@ -96,11 +99,11 @@ describe("expandHome", () => {
 });
 
 describe("loadConfig", () => {
+	// CI 安全：不 shell 出 node 子进程拿 tmpdir/清理文件（GitHub windows runner
+	// 上外部 spawn 曾导致 5s 测试超时）；全部用进程内 node:os/node:fs。
+
 	test("loads valid file", async () => {
-		const dir = Bun.spawnSync({ cmd: ["node", "-e", "console.log(require('os').tmpdir())"] }).stdout
-			.toString()
-			.trim();
-		const file = `${dir}/omp-gw-test-${Date.now()}.yml`;
+		const file = join(tmpdir(), `omp-gw-test-${Date.now()}.yml`);
 		await Bun.write(
 			file,
 			"qq:\n  app_id: \"1\"\n  app_secret: \"!echo secret-from-cmd\"\nscheduler:\n  tick_s: 30\n",
@@ -112,22 +115,27 @@ describe("loadConfig", () => {
 			expect(cfg.scheduler.tick_s).toBe(30);
 			expect(cfg.delivery.home_channel).toBe("");
 		} finally {
-			Bun.spawnSync({ cmd: ["node", "-e", `require('fs').unlinkSync(${JSON.stringify(file)})`] });
+			try {
+				unlinkSync(file);
+			} catch {
+				// already gone
+			}
 		}
-	});
+	}, 20_000); // 宽松超时：命令解析 spawn 本身带 10s 上限
 	test("missing file throws ConfigError", () => {
 		expect(() => loadConfig("C:/nonexistent/nope.yml")).toThrow(ConfigError);
 	});
 	test("invalid config throws ConfigError", async () => {
-		const dir = Bun.spawnSync({ cmd: ["node", "-e", "console.log(require('os').tmpdir())"] }).stdout
-			.toString()
-			.trim();
-		const file = `${dir}/omp-gw-bad-${Date.now()}.yml`;
+		const file = join(tmpdir(), `omp-gw-bad-${Date.now()}.yml`);
 		await Bun.write(file, "qq:\n  app_id: \"1\"\nadmin:\n  port: 99999\n");
 		try {
 			expect(() => loadConfig(file)).toThrow(ConfigError);
 		} finally {
-			Bun.spawnSync({ cmd: ["node", "-e", `require('fs').unlinkSync(${JSON.stringify(file)})`] });
+			try {
+				unlinkSync(file);
+			} catch {
+				// already gone
+			}
 		}
-	});
+	}, 20_000);
 });
