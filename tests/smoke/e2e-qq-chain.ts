@@ -42,6 +42,7 @@ const cfg: GatewayConfig = {
 		tick_s: 3600,
 		max_concurrent_jobs: 2,
 		misfire_grace_s: 300,
+		stale_execution_s: 3600,
 		nudge_after_failures: 3,
 		ledger: ":memory:",
 		liveness_dir: "",
