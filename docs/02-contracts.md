@@ -29,6 +29,8 @@ qq:
     - C2C_MESSAGE_CREATE         # 私聊
     - GROUP_AT_MESSAGE_CREATE    # 群 @
     # - PUBLIC_GUILD_MESSAGES    # 频道（默认关）
+    # - DIRECT_MESSAGE_CREATE    # 频道私信
+    # - INTERACTION_CREATE       # 互动消息
   allow:
     users: []                    # 空 = 全部（配合 allow_all_users）
     groups: []
@@ -39,6 +41,7 @@ qq:
     api_key: ""
     model: glm-asr
   markdown_support: false        # msg_type 2，需 QQ 模板审核
+  typing_indicator: true         # C2C 消息处理期间发送"正在输入"（50s debounce）
 
 # --- omp 驱动 ---
 omp:
@@ -58,6 +61,9 @@ scheduler:
   misfire_grace_s: 300           # 错过窗口宽限
   nudge_after_failures: 3        # 连续失败后向 home channel 提醒
   ledger: ~/.omp-gateway/ledger.db  # bun:sqlite 台账文件
+  liveness_dir: ""                 # liveness 信号目录（ticker_heartbeat/last_success/last_error）；空 = 关闭
+  completed_once_retention_days: 7 # 已完成的 once job 留存天数（0 = 不清理）
+  output_retention: 50             # 每个 job 的输出文件留存上限（0 = 不清理）
 
 # --- 投递 ---
 delivery:
@@ -65,6 +71,7 @@ delivery:
   home_channel: ""               # cron 结果默认投递目标（对等 hermes QQBOT_HOME_CHANNEL）
   wrap_response: true            # 响应包装（时间戳/来源），可关
   silent_trigger: "[SILENT]"     # prompt 前缀触发静默投递
+  filter_silence_narration: true # 投递前过滤静音叙述 token（*(silent)*/🔇/裸 "."/"…"）
 ```
 
 ### 1.1 密钥解析
@@ -96,18 +103,20 @@ interface Job {
     skills?: string[];           // 注入技能（空=默认全部）
     tools?: string[];            // 工具白名单（空=默认集）
     system_prompt_append?: string;
+    context_from?: string[];     // job 链：这些 job 的最新 completed 输出注入本次 prompt
     // no-agent 任务（$0）：
     script?: string;             // shell 脚本内容或文件路径
     wake_agent?: boolean;        // false = 预检门：先跑脚本，仅非空输出时唤醒 agent
   };
 
   delivery: {
-    target: "file" | "qq" | "origin";   // 默认取全局 delivery.default_target
+    target: string;              // "file" | "qq" | "origin" | "all"（home+origin 去重）| chatKey 直发；逗号分隔多目标混合；默认取全局 delivery.default_target
     file?: string;               // target=file 时的输出路径
     qq_chat?: string;            // target=qq 时的显式目标（缺省=home_channel）
     silent?: boolean;
     continuable?: boolean;       // 允许回帖续聊（默认 true）
     wrap_response?: boolean;     // 覆盖全局
+    markdown_support?: boolean;  // 投递前剥离 markdown（QQ 非 markdown 模式）
   };
 
   workdir?: string;              // 执行目录（并发 job 串行化锁粒度）
@@ -120,6 +129,7 @@ interface Job {
   last_run: string | null;
   run_count: number;
   fail_streak: number;
+  meta?: Record<string, unknown>;  // provider_snapshot：未 pin 模型的 agent job 创建时记录的全局默认（模型漂移守卫快照）
   created_at: string;
   updated_at: string;
 }
@@ -176,6 +186,13 @@ interface Execution {
 **防重叠**：`jobs.status = running` + `executions.status IN (claimed, running)` 的独占
 检查；同 `workdir` 的 job 串行化（文件锁 `workdir/.omp-gateway.lock`）。
 
+**投递义务 ledger（表 `deliveries`）**：QQ 投递先落表再发送，崩溃重启后未完成行重投
+（at-least-once）。状态机 `pending → attempting → delivered / failed`（failed 最多重试
+N 次后放弃）；重启重投时 attempting 行带 ♻️ 重复标记（诚实 at-least-once，原消息可能已送达）。
+
+**`dead_targets`**：确认不可达的 chat（群被删/被踢/用户停用）短路后续投递，不再每 tick
+重试；任一次发送成功自动自愈清除。
+
 ## 5. omp 驱动协议（OmpRpcClient）
 
 ### 5.1 子进程生命周期
@@ -206,6 +223,12 @@ interface Execution {
 - `set_host_tools`（注册宿主工具，如 `qq_send`、`task_status`）
 - `get_state`、`get_last_assistant_text`
 
+**输出审计与 job 链**：每次运行输出落盘 `outputs/<jobId>/<ts>.txt`（`scheduler.ledger` 同
+目录），路径记入 `executions.output_ref`（取回时 >64KB 截断）；`action.context_from` 所列
+job 的最新 completed 输出经 `lastOutput` 注入本次 prompt。模型漂移守卫：未 pin 模型的 agent
+job 创建时快照全局默认（`meta.provider_snapshot`），当前默认漂移 → fail-closed 不烧 token，
+要求显式 pin。
+
 ### 5.3 事件面
 - `agent_start/end`（`isTerminal` 判定完成）
 - `message_update`（text_delta 逐 token → delivery 流式转发）
@@ -216,8 +239,17 @@ interface Execution {
 
 ### 6.1 inbound（WebSocket）
 - 端点：`wss://api.sgroup.qq.com/`（经 `portal_host` 推导）；鉴权 `Authorization: QQBot <AppID>.<AppSecret>`（分片签名），`X-Union-Appid`。
-- 心跳：协议自带 ping/pong（`READY`/`RESUMED`/`HEARTBEAT`），断线自动 RESUMED/重连（指数退避 1s→2s→4s→…上限 60s）。
-- 事件：`C2C_MESSAGE_CREATE`、`GROUP_AT_MESSAGE_CREATE`（含 `GROUP_MESSAGE_CREATE` 全量群消息订阅可选）、频道事件。事件体含 `id`（消息去重）、`author.user_openid`/`group_openid`、`content`、`attachments`（含 `asr_refer_text` 语音转写）。
+- 心跳：op 1 帧携带 `d = lastSeq`（最近一次 dispatch seq），按服务器 interval 的 **80%** 发送
+  （抗抖动）；op 7（服务器要求重连）关闭连接走 RESUME，op 9（invalid session）丢弃会话重新
+  IDENTIFY；断线指数退避 1s→2s→4s→…上限 60s。
+- IDENTIFY：`intents` 掩码（按配置位或合成）+ `shard: [0,1]` + `properties`（$os/$browser/$device）。
+- 事件：`C2C_MESSAGE_CREATE`、`GROUP_AT_MESSAGE_CREATE`（含 `GROUP_MESSAGE_CREATE` 全量群消息
+  订阅可选）、`DIRECT_MESSAGE_CREATE`、`INTERACTION_CREATE`、频道事件。事件体含 `id`（消息去重）、
+  `author.user_openid`/`group_openid`、`content`、`attachments`。
+- 语音/附件：优先取 `voice_wav_url`（QQ 预转 WAV，免 SILK 解码），否则下载原始 SILK/AMR 经
+  ffmpeg 转 WAV 再送 STT；转写成功注入 `[语音转写] <text>`，失败标记 `[语音识别失败]`；文件附件
+  注入 `[file: name (url)]` 交由 agent 处理。
+- 引用消息：`message_type 103` 时从 `msg_elements[0]` 解析被引内容与附件（纯引用回复也可用）。
 - 去重：以事件 `id` 维护滑动窗口（防重投）。
 
 ### 6.2 outbound（REST）
@@ -237,6 +269,10 @@ continuable 续聊 = 同一 chat_key 的消息路由到同一 session（RPC 复�
   （`QQBOT_`/`app_secret`/`sk-` 等）→ 命中则脱敏/阻断并告警（对应 hermes 注入扫描）。
 - preflight：job 创建时校验 config 有效性（模型可解析、脚本存在、目标可写），失败
   **不烧 token** 直接报错（对应 hermes `blocked_config`）。
+- lifecycle guard：拒绝 prompt/script 含网关生命周期命令（kill/pkill/taskkill/reboot/shutdown、
+  `sc|nssm|systemctl|launchctl` 等服务控制作用于网关）的 job，并**递归扫描引用的 shell/python 脚本**。
+- 附件 URL 安全（SSRF）：仅放行公网 http(s) URL，拒绝回环/私网/链路本地/保留段。
+- 附件下载带 `Authorization: QQBot <token>` 头（QQ 多媒体 CDN 要求）。
 
 ## 7. 插件壳 ↔ daemon IPC（Phase 2 契约，先定义）
 
