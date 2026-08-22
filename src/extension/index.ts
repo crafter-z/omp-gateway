@@ -162,12 +162,35 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 	});
 
 	// ---- inbound events: inject QQ messages into the live session ----
+	//
+	// 生命周期约定：工厂在安装校验时也会被真实实例化（omp 的
+	// runExtensionFactory），因此工厂内不允许顶层副作用——否则校验进程
+	// 会因常驻句柄永不退出（曾因 daemon 未跑时的无限重连定时器挂死
+	// `omp plugin install`）。WS 改为会话级：session_start 惰性连接，
+	// session_shutdown 断开并停止重连。
+	let ws: WebSocket | null = null;
+	let stopped = false;
+
+	function disconnectEvents(): void {
+		stopped = true;
+		if (ws) {
+			try {
+				ws.close();
+			} catch {
+				// already closed
+			}
+			ws = null;
+		}
+	}
+
 	function connectEvents(): void {
+		disconnectEvents(); // 幂等：先清旧连接与重连状态
+		stopped = false;
 		const wsUrl = adminUrl.replace(/^http/, "ws") + "/api/ws";
-		let closed = false;
-		const ws = new WebSocket(wsUrl, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
-		ws.addEventListener("open", () => pi.logger.debug("gateway event stream connected", { wsUrl }));
-		ws.addEventListener("message", (ev) => {
+		const socket = new WebSocket(wsUrl, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
+		ws = socket;
+		socket.addEventListener("open", () => pi.logger.debug("gateway event stream connected", { wsUrl }));
+		socket.addEventListener("message", (ev) => {
 			let e: AdminEvent;
 			try {
 				e = JSON.parse(typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data as ArrayBuffer));
@@ -178,13 +201,19 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 				pi.sendUserMessage(`[QQ ${e.chatKey}] ${e.text}`, { deliverAs: "steer" });
 			}
 		});
-		ws.addEventListener("close", () => {
-			if (closed) return;
-			setTimeout(connectEvents, 5000);
+		socket.addEventListener("close", () => {
+			if (ws !== socket || stopped) return; // 已被 shutdown 断开，不再重连
+			setTimeout(connectEvents, 5000); // 会话存续期内的重连（daemon 掉线自愈）
 		});
-		ws.addEventListener("error", () => {
+		socket.addEventListener("error", () => {
 			// close follows; reconnection handled there
 		});
 	}
-	connectEvents();
+
+	pi.on("session_start", () => {
+		if (!ws && !stopped) connectEvents();
+	});
+	pi.on("session_shutdown", () => {
+		disconnectEvents();
+	});
 }
