@@ -6,6 +6,11 @@
   "bin": {
     "omp-gateway": "./src/index.ts"
   },
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
