@@ -26,6 +26,9 @@ function makeCtx(overrides: Partial<AdminContext> = {}): AdminContext & {
 		removeJob: (id) => removed.push(id),
 		syncJob: (id) => synced.push(id),
 		sendQq: async (chatKey, text) => void sent.push({ chatKey, text }),
+		sendQqMedia: async () => {},
+		deadTargets: () => [],
+		clearDeadTarget: () => {},
 		subscribe: (l) => {
 			listeners.add(l);
 			return () => listeners.delete(l);

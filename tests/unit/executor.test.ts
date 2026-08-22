@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { acquireLock } from "../../src/util/lock.ts";
 import { DefaultExecutor } from "../../src/scheduler/executor.ts";
 import type { AgentRunner, Job, RunResult } from "../../src/scheduler/types.ts";
 
@@ -48,17 +50,23 @@ describe("DefaultExecutor — agent jobs", () => {
       return { ok: true, output: `res:${prompt}`, meta: { model: opts.model } };
     });
     const executor = new DefaultExecutor({ runner });
+    const wd = join(tmpdir(), `omp-gw-wd-${crypto.randomUUID()}`);
+    await mkdir(wd, { recursive: true });
     const job = makeJob({
       action: { type: "agent", prompt: "do the thing", model: "gpt-4o" },
-      workdir: "C:/tmp/wd",
+      workdir: wd,
       ttl_s: 90,
     });
 
-    const result = await executor.execute(job, new Date("2026-08-20T10:00:00.000Z"));
-    expect(calls).toHaveLength(1);
-    expect(calls[0].prompt).toBe("do the thing");
-    expect(calls[0].opts).toEqual({ model: "gpt-4o", cwd: "C:/tmp/wd", timeoutMs: 90_000 });
-    expect(result).toEqual({ ok: true, output: "res:do the thing", meta: { model: "gpt-4o" } }); // 直通
+    try {
+      const result = await executor.execute(job, new Date("2026-08-20T10:00:00.000Z"));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].prompt).toBe("do the thing");
+      expect(calls[0].opts).toEqual({ model: "gpt-4o", cwd: wd, timeoutMs: 90_000 });
+      expect(result).toEqual({ ok: true, output: "res:do the thing", meta: { model: "gpt-4o" } }); // 直通
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 
   test("omits undefined options when job has no model/workdir/ttl", async () => {
@@ -209,5 +217,77 @@ describe("DefaultExecutor — no-agent jobs", () => {
     const result = await executor.execute(job, new Date());
     expect(result.ok).toBe(false);
     expect(result.error).toBe("timeout");
+  });
+});
+
+describe("DefaultExecutor — workdir serialization", () => {
+  async function makeWorkdir(): Promise<string> {
+    const wd = join(tmpdir(), `omp-gw-wd-${crypto.randomUUID()}`);
+    await mkdir(wd, { recursive: true });
+    return wd;
+  }
+
+  test("fails without invoking the runner when another job holds the workdir lock", async () => {
+    const wd = await makeWorkdir();
+    const lock = await acquireLock(wd, { timeoutMs: 5_000 });
+    try {
+      const { runner, calls } = makeRunner();
+      const executor = new DefaultExecutor({ runner });
+      const job = makeJob({ workdir: wd, action: { type: "agent", prompt: "x" }, ttl_s: 0.1 });
+
+      const result = await executor.execute(job, new Date());
+      expect(result.ok).toBe(false);
+      expect(result.output).toBe("");
+      expect(result.error).toContain("workdir");
+      expect(calls).toHaveLength(0); // 抢锁失败不烧 token
+    } finally {
+      await lock.release();
+    }
+    await rm(wd, { recursive: true, force: true });
+  });
+
+  test("jobs sharing a workdir run strictly one at a time", async () => {
+    const wd = await makeWorkdir();
+    const order: string[] = [];
+    const { runner } = makeRunner(async (prompt) => {
+      order.push(`start:${prompt}`);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      order.push(`end:${prompt}`);
+      return { ok: true, output: prompt };
+    });
+    const executor = new DefaultExecutor({ runner });
+    const mkJob = (id: string, prompt: string) => makeJob({ id, workdir: wd, action: { type: "agent", prompt } });
+
+    try {
+      const [r1, r2] = await Promise.all([
+        executor.execute(mkJob("j1", "a"), new Date()),
+        executor.execute(mkJob("j2", "b"), new Date()),
+      ]);
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      expect(order).toHaveLength(4);
+      expect(order[0].startsWith("start:")).toBe(true);
+      expect(order[1]).toBe(`end:${order[0].slice("start:".length)}`); // 前一个先跑完
+      expect(order[2].startsWith("start:")).toBe(true);
+      expect(order[3]).toBe(`end:${order[2].slice("start:".length)}`);
+      expect(order[2]).not.toBe(order[0]); // 第二个 job 才轮到
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  test("releases the workdir lock after execution", async () => {
+    const wd = await makeWorkdir();
+    const { runner } = makeRunner();
+    const executor = new DefaultExecutor({ runner });
+    const job = makeJob({ workdir: wd, action: { type: "agent", prompt: "x" } });
+
+    try {
+      const result = await executor.execute(job, new Date());
+      expect(result.ok).toBe(true);
+      expect(existsSync(`${wd}.lock`)).toBe(false); // finally 中已释放并清理
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 });

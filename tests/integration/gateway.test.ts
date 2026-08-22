@@ -83,14 +83,20 @@ describe("QqGateway", () => {
     expect(seen).toHaveLength(0);
   });
 
-  test("sends QQBot Authorization and X-Union-Appid headers on upgrade", async () => {
-    const h = await createWsServer({ requireAuth: true });
+  test("IDENTIFY carries QQBot <token> from the tokenProvider", async () => {
+    const h = await createWsServer();
     openServers.push(h);
-    await startGateway(async () => {}, h.url);
+    const gw = new QqGateway(CFG, async () => {}, {
+      wsUrl: h.url,
+      tokenProvider: async () => "tok-xyz",
+    });
+    openGateways.push(gw);
+    await gw.connect();
 
-    expect(h.sockets.size).toBe(1);
-    expect(h.lastHeaders?.authorization).toBe("QQBot test-app.test-secret");
-    expect(h.lastHeaders?.xUnionAppid).toBe("test-app");
+    expect(h.lastIdentify).toMatchObject({
+      op: 2,
+      d: { token: "QQBot tok-xyz", intents: expect.any(Number), shard: [0, 1] },
+    });
   });
 
   test("C2C_MESSAGE_CREATE dispatch reaches the handler with normalized fields", async () => {
@@ -198,6 +204,28 @@ describe("QqGateway", () => {
     pushC2C(h, firstSocket(h), "after-reconnect", "back");
     await waitFor(() => seen.length === 1);
     expect(seen[0].text).toBe("back");
+  });
+
+  test("attempts one op 6 RESUME with session id + last seq after abnormal close", async () => {
+    const h = await createWsServer({ acceptResume: true });
+    openServers.push(h);
+    const seen: InboundMessage[] = [];
+    const gw = await startGateway(async (m) => {
+      seen.push(m);
+    }, h.url);
+
+    // 产生 dispatch seq（推两条，客户端记 lastSeq=第二条）
+    pushC2C(h, firstSocket(h), "seq-1", "one");
+    pushC2C(h, firstSocket(h), "seq-2", "two");
+    await waitFor(() => seen.length === 2);
+    expect(h.lastResume).toBeNull(); // 正常运行期无 RESUME
+
+    // 异常断开 → 重连时应发 op 6 携带 session_id 与 last seq
+    h.kill(firstSocket(h));
+    await waitFor(() => h.sockets.size === 1 && firstSocket(h) !== undefined && h.lastResume !== null, 5000);
+
+    expect(h.lastResume).toEqual({ session_id: "mock-session", seq: expect.any(Number) });
+    await gw.stop();
   });
 
   test("stop cancels reconnection", async () => {

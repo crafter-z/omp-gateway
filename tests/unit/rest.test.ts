@@ -56,8 +56,8 @@ describe("sendText", () => {
 
     expect(res).toEqual({ id: "send-ok-1" });
     expect(fetchCalls.map((c) => c.url)).toEqual([
-      "https://apps.q.qq.com/app/getAppAccessToken",
-      "https://api.q.qq.com/v2/users/u1/messages",
+      "https://bots.qq.com/app/getAppAccessToken",
+      "https://api.sgroup.qq.com/v2/users/u1/messages",
     ]);
     expect(bodyOf(fetchCalls[0])).toEqual({ appId: "app-1", clientSecret: "sec-1" });
     expect(bodyOf(fetchCalls[1])).toEqual({ content: "hi there", msg_type: 0 });
@@ -66,15 +66,15 @@ describe("sendText", () => {
 
   test("routes group chats to /v2/groups/{group_openid}/messages", async () => {
     const res = await sendText(CFG, { chatKey: "group:g9", openid: "g9" }, "yo");
-    expect(fetchCalls[1].url).toBe("https://api.q.qq.com/v2/groups/g9/messages");
+    expect(fetchCalls[1].url).toBe("https://api.sgroup.qq.com/v2/groups/g9/messages");
     expect(res.id).toBe("send-ok-1");
   });
 
-  test("honors portal_host and echoes msg_id for passive replies", async () => {
+  test("API base is api.sgroup.qq.com regardless of portal_host; echoes msg_id for passive replies", async () => {
     const cfg: QqConfig = { app_id: "app-1", app_secret: "sec-1", portal_host: "sandbox.q.qq.com" };
     await sendText(cfg, { chatKey: "c2c:u1", openid: "u1" }, "reply", { msgId: "in-99" });
-    expect(fetchCalls[0].url).toBe("https://apps.sandbox.q.qq.com/app/getAppAccessToken");
-    expect(fetchCalls[1].url).toBe("https://api.sandbox.q.qq.com/v2/users/u1/messages");
+    expect(fetchCalls[0].url).toBe("https://bots.qq.com/app/getAppAccessToken");
+    expect(fetchCalls[1].url).toBe("https://api.sgroup.qq.com/v2/users/u1/messages");
     expect(bodyOf(fetchCalls[1])).toEqual({ content: "reply", msg_type: 0, msg_id: "in-99" });
   });
 
@@ -146,9 +146,9 @@ describe("sendMedia", () => {
 
     expect(res).toEqual({ id: "media-msg-1" });
     expect(fetchCalls.map((c) => c.url)).toEqual([
-      "https://apps.q.qq.com/app/getAppAccessToken",
-      "https://api.q.qq.com/v2/users/u1/files",
-      "https://api.q.qq.com/v2/users/u1/messages",
+      "https://bots.qq.com/app/getAppAccessToken",
+      "https://api.sgroup.qq.com/v2/users/u1/files",
+      "https://api.sgroup.qq.com/v2/users/u1/messages",
     ]);
     // upload: multipart form with the raw bytes + file_type 1
     const upload = fetchCalls[1]!;
@@ -171,8 +171,8 @@ describe("sendMedia", () => {
 
     const res = await sendMedia(CFG, { chatKey: "group:g9", openid: "g9" }, filePath, "image");
     expect(res.id).toBe("media-msg-1");
-    expect(fetchCalls[1]!.url).toBe("https://api.q.qq.com/v2/groups/g9/files");
-    expect(fetchCalls[2]!.url).toBe("https://api.q.qq.com/v2/groups/g9/messages");
+    expect(fetchCalls[1]!.url).toBe("https://api.sgroup.qq.com/v2/groups/g9/files");
+    expect(fetchCalls[2]!.url).toBe("https://api.sgroup.qq.com/v2/groups/g9/messages");
   });
 
   test("file kind uploads with file_type 3", async () => {
@@ -199,15 +199,15 @@ describe("sendMedia", () => {
     });
   });
 
-  test("honors portal_host on both upload and message calls", async () => {
+  test("media upload and message calls use the api.sgroup.qq.com base regardless of portal_host", async () => {
     const filePath = makeMediaFile();
     await Bun.write(filePath, MEDIA_BYTES);
     const cfg: QqConfig = { app_id: "app-1", app_secret: "sec-1", portal_host: "sandbox.q.qq.com" };
     globalThis.fetch = mediaMock();
 
     await sendMedia(cfg, { chatKey: "c2c:u1", openid: "u1" }, filePath, "image");
-    expect(fetchCalls[1]!.url).toBe("https://api.sandbox.q.qq.com/v2/users/u1/files");
-    expect(fetchCalls[2]!.url).toBe("https://api.sandbox.q.qq.com/v2/users/u1/messages");
+    expect(fetchCalls[1]!.url).toBe("https://api.sgroup.qq.com/v2/users/u1/files");
+    expect(fetchCalls[2]!.url).toBe("https://api.sgroup.qq.com/v2/users/u1/messages");
   });
 
   test("throws with the response body when the upload fails", async () => {

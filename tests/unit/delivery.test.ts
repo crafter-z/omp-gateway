@@ -51,8 +51,8 @@ describe("Delivery", () => {
 		const d = makeDeps();
 		const delivery = new Delivery(d);
 		const res = await delivery.deliver({ ok: true, output: "x" }, job());
-		expect(res.target).toBe("qq");
-		expect(res.chatKey).toBe("home");
+		expect(res[0].target).toBe("qq");
+		expect(res[0].chatKey).toBe("home");
 		expect(d.sent[0]!.chat).toBe("home");
 		expect(d.sent[0]!.text).toContain("x");
 	});
@@ -69,7 +69,7 @@ describe("Delivery", () => {
 			{ ok: true, output: "data" },
 			job({ delivery: { target: "file", file: "out.txt" } }),
 		);
-		expect(res.path).toBe("out.txt");
+		expect(res[0].path).toBe("out.txt");
 		expect(d.files[0]).toEqual(["out.txt", expect.stringContaining("data")]);
 		expect(d.sent.length).toBe(0);
 	});
@@ -147,7 +147,7 @@ describe("Delivery scanning", () => {
 		});
 		const delivery = new Delivery(d);
 		const res = await delivery.deliver({ ok: true, output: "leak sk-abc here" }, job());
-		expect(res.segments).toBe(1);
+		expect(res[0].segments).toBe(1);
 		expect(d.sent[0]!.text).toBe("leak [REDACTED:sk-] here");
 		expect(hits).toEqual([["test-job", ["sk-"]]]);
 	});
@@ -184,8 +184,8 @@ describe("Delivery segmentation", () => {
 		const delivery = new Delivery(d);
 		const output = "x".repeat(4500);
 		const res = await delivery.deliver({ ok: true, output }, job());
-		expect(res.segments).toBe(3);
-		expect(res.chatKey).toBe("home");
+		expect(res[0].segments).toBe(3);
+		expect(res[0].chatKey).toBe("home");
 		expect(d.sent.map((s) => s.text.length)).toEqual([2000, 2000, 500]);
 		expect(d.sent.map((s) => s.text).join("")).toBe(output);
 	});
@@ -193,7 +193,7 @@ describe("Delivery segmentation", () => {
 		const d = makeDeps({ wrapResponse: false });
 		const delivery = new Delivery(d);
 		const res = await delivery.deliver({ ok: true, output: "short" }, job());
-		expect(res.segments).toBe(1);
+		expect(res[0].segments).toBe(1);
 		expect(d.sent).toHaveLength(1);
 	});
 	test("origin is segmented and routed to origin chat", async () => {
@@ -203,8 +203,8 @@ describe("Delivery segmentation", () => {
 		const res = await delivery.deliver({ ok: true, output }, job({ delivery: { target: "origin" } }), {
 			originChatKey: "c2c:origin",
 		});
-		expect(res.target).toBe("origin");
-		expect(res.segments).toBe(3);
+		expect(res[0].target).toBe("origin");
+		expect(res[0].segments).toBe(3);
 		expect(d.sent).toHaveLength(3);
 		expect(d.sent.every((s) => s.chat === "c2c:origin")).toBe(true);
 	});
@@ -212,7 +212,7 @@ describe("Delivery segmentation", () => {
 		const d = makeDeps();
 		const delivery = new Delivery(d);
 		const res = await delivery.deliver({ ok: true, output: "[SILENT] hidden" }, job());
-		expect(res.segments).toBe(0);
+		expect(res[0].segments).toBe(0);
 	});
 	test("file outcome reports one segment", async () => {
 		const d = makeDeps();
@@ -221,8 +221,8 @@ describe("Delivery segmentation", () => {
 			{ ok: true, output: "data" },
 			job({ delivery: { target: "file", file: "out.txt" } }),
 		);
-		expect(res.path).toBe("out.txt");
-		expect(res.segments).toBe(1);
+		expect(res[0].path).toBe("out.txt");
+		expect(res[0].segments).toBe(1);
 	});
 	test("segmented delivery still redacts on scan hit", async () => {
 		const d = makeDeps({
@@ -232,7 +232,7 @@ describe("Delivery segmentation", () => {
 		const delivery = new Delivery(d);
 		const output = "secret " + "z".repeat(4000);
 		const res = await delivery.deliver({ ok: true, output }, job());
-		expect(res.segments).toBe(3);
+		expect(res[0].segments).toBe(3);
 		expect(d.sent.map((s) => s.text).join("")).toBe("[REDACTED] " + "z".repeat(4000));
 	});
 });
