@@ -160,6 +160,54 @@ export class Ledger {
   }
 
   /**
+   * 并发闸满等未真正执行的场景：直接落一条 failed 台账（不经过 claim 状态机），
+   * error=reason、meta.skipped=true，并按失败回写 job（fail_streak++、last_run、status 复位）。
+   * 用于 once job 被 maxConcurrentJobs 跳过时的诚实记账——否则 once 无下次触发，静默丢失。
+   */
+  markSkipped(job: Job, reason: string): Execution {
+    const nowIso = new Date().toISOString();
+    const prev = this.store.db
+      .query<{ n: number }, SQLQueryBindings[]>("SELECT COUNT(*) AS n FROM executions WHERE job_id = ?")
+      .get(job.id)!;
+    const execution: Execution = {
+      id: `${job.id}:${prev.n + 1}`,
+      job_id: job.id,
+      status: "failed",
+      kind: job.action.type,
+      scheduled_at: job.next_run ?? nowIso,
+      claimed_at: null,
+      started_at: null,
+      finished_at: nowIso,
+      exit_code: null,
+      output_ref: null,
+      error: reason,
+      meta: { skipped: true },
+    };
+    this.store.db
+      .query(
+        `INSERT INTO executions
+           (id, job_id, status, kind, scheduled_at, claimed_at, started_at, finished_at, exit_code, output_ref, error, meta)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        execution.id,
+        execution.job_id,
+        execution.status,
+        execution.kind,
+        execution.scheduled_at,
+        null,
+        null,
+        execution.finished_at,
+        null,
+        null,
+        execution.error,
+        JSON.stringify(execution.meta),
+      );
+    this.syncJobAfterFinish(job.id, "failed", nowIso);
+    return execution;
+  }
+
+  /**
    * 超时/崩溃 → unknown；把 jobs.status 复位为 idle/disabled（不动 last_run/run_count/fail_streak）。
    * 带状态守卫：仅 claimed/running 会被置 unknown；job 状态复位仅在没有其他
    * 占用中的 execution 时执行（防止复位并发新 claim 的 running 状态）。

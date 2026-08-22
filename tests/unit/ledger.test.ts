@@ -149,6 +149,33 @@ describe("Ledger state transitions", () => {
     expect(j.last_run).not.toBeNull();
   });
 
+  test("markSkipped records a failed execution with skipped meta and bumps fail_streak", () => {
+    const store = new JobStore(":memory:");
+    const ledger = new Ledger(store);
+    const job = store.add(makeInput({ schedule: { kind: "once", expr: "2026-08-20T10:05:00.000Z" } }));
+    const exec = ledger.markSkipped(job, "skipped: maxConcurrentJobs reached");
+
+    expect(exec.status).toBe("failed");
+    expect(exec.error).toBe("skipped: maxConcurrentJobs reached");
+    expect(exec.meta).toEqual({ skipped: true });
+    expect(exec.finished_at).not.toBeNull();
+
+    const row = store.db
+      .query<{ status: string; error: string | null; claimed_at: string | null; started_at: string | null }, [string]>(
+        "SELECT status, error, claimed_at, started_at FROM executions WHERE id = ?",
+      )
+      .get(exec.id)!;
+    expect(row.status).toBe("failed");
+    expect(row.error).toBe("skipped: maxConcurrentJobs reached");
+    expect(row.claimed_at).toBeNull(); // 未经过 claim 状态机
+    expect(row.started_at).toBeNull();
+
+    const j = store.get(job.id)!;
+    expect(j.fail_streak).toBe(1);
+    expect(j.run_count).toBe(1);
+    expect(j.last_run).not.toBeNull();
+  });
+
   test("markCompleted on a paused job restores status to disabled", () => {
     const store = new JobStore(":memory:");
     const ledger = new Ledger(store);

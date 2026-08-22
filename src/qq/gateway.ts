@@ -174,6 +174,7 @@ export class QqGateway {
    * IDENTIFY/RESUME token, not upgrade headers.
    */
   private async openSocketAsync(): Promise<void> {
+    if (this.stopped) return; // stop() 之后到达的重连触发不再建新连接
     let url: string;
     if (this.opts.wsUrl) {
       url = this.opts.wsUrl;
@@ -181,6 +182,8 @@ export class QqGateway {
       url = this.cfg.ws_url;
     } else {
       url = await this.discoverGatewayUrl().catch(() => FALLBACK_WS_URL);
+      // discover 有异步间隙：stop() 可能已发生，此时放弃建连
+      if (this.stopped) return;
     }
     const ws = new WebSocket(url);
     this.ws = ws;

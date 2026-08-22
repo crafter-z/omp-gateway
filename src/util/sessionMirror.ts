@@ -13,7 +13,7 @@
  * We append one synthetic user-role message chained to the last entry id.
  * Missing/unparseable files are skipped — mirroring never breaks delivery.
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 
 const MAX_MIRROR_CHARS = 64_000;
 
@@ -71,10 +71,10 @@ export async function mirrorToSession(
       },
     };
 
-    // 原子写：同目录 .tmp → rename（Windows 上 rename 覆盖已存在文件）。
-    const tmp = `${sessionPath}.tmp`;
-    writeFileSync(tmp, raw.endsWith("\n") ? `${raw}${JSON.stringify(entry)}\n` : `${raw}\n${JSON.stringify(entry)}\n`);
-    renameSync(tmp, sessionPath);
+    // 追加写：单次 write 原子追加一行，避免整文件重写与活跃聊天的覆盖竞态
+    // （Windows 上 tmp+rename 也无法原子替换正被读取的文件）。
+    const prefix = raw.endsWith("\n") || raw === "" ? "" : "\n";
+    appendFileSync(sessionPath, `${prefix}${JSON.stringify(entry)}\n`);
   } catch (err) {
     log?.(`session mirror skipped: ${err instanceof Error ? err.message : String(err)}`);
   }

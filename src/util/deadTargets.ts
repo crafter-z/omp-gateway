@@ -30,7 +30,32 @@ const DEAD_HINTS = [
   "user is not accessible",
   "bot is not in the group",
   "channel not found",
+  // 中文网关错误（官方 bot 平台常见文案）
+  "群不存在",
+  "机器人已被移出",
+  "用户不存在",
+  "非法的 openid",
+  "不在群内",
+  "qq 已注销",
 ];
+
+/** 死标记过期窗口：24h。 */
+const EXPIRE_MS = 86_400_000;
+/** 死目标探活最小间隔：10 分钟。 */
+export const DEAD_PROBE_INTERVAL_MS = 600_000;
+
+/**
+ * 是否允许对已死目标发起一次真实探活发送（自愈）：距上次探活 ≥10 分钟才放行。
+ * lastProbeAt 由调用方（daemon）持有，进程内记忆即可。
+ */
+export function shouldProbeDead(
+  chatKey: string,
+  lastProbeAt: Map<string, number>,
+  now: number = Date.now(),
+): boolean {
+  const last = lastProbeAt.get(chatKey);
+  return last === undefined || now - last >= DEAD_PROBE_INTERVAL_MS;
+}
 
 export function isDeadTargetError(message: string): boolean {
   const s = message.toLowerCase();
@@ -42,12 +67,19 @@ export class DeadTargetRegistry {
     db.run(CREATE_SQL);
   }
 
-  /** True when the chat is currently marked dead. */
-  isDead(chatKey: string): boolean {
+  /**
+   * True when the chat has a dead mark from within the last 24h. Older marks
+   * expire so a chat that was recreated (group restored / user reactivated)
+   * gets real send attempts again even without a probe.
+   */
+  isDead(chatKey: string, now: number = Date.now()): boolean {
+    const cutoff = new Date(now - EXPIRE_MS).toISOString();
     return (
       this.db
-        .query<{ n: number }, SQLQueryBindings[]>("SELECT COUNT(*) AS n FROM dead_targets WHERE chat_key = ?")
-        .get(chatKey)!.n > 0
+        .query<{ n: number }, SQLQueryBindings[]>(
+          "SELECT COUNT(*) AS n FROM dead_targets WHERE chat_key = ? AND marked_at > ?",
+        )
+        .get(chatKey, cutoff)!.n > 0
     );
   }
 

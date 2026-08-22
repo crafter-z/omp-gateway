@@ -15,7 +15,7 @@ import { parseEvent } from "../../src/qq/events.ts";
 import { isSafeUrl } from "../../src/util/urlsafe.ts";
 import { isAutonomousSilenceResponse, filterSilenceNarration } from "../../src/util/silence.ts";
 import { summarizeFailure } from "../../src/util/classify.ts";
-import { DeadTargetRegistry, isDeadTargetError } from "../../src/util/deadTargets.ts";
+import { DeadTargetRegistry, isDeadTargetError, shouldProbeDead } from "../../src/util/deadTargets.ts";
 import { DeliveryLedger, MAX_ATTEMPTS } from "../../src/util/deliveryLedger.ts";
 import { scanLifecycleThreat } from "../../src/scheduler/preflight.ts";
 import { QqGateway } from "../../src/qq/gateway.ts";
@@ -231,6 +231,44 @@ describe("DeadTargetRegistry", () => {
     db.close();
   });
 
+  test("isDead expires marks older than 24h", () => {
+    const db = new Database(":memory:");
+    const reg = new DeadTargetRegistry(db);
+    const now = Date.now();
+    reg.markDead("group:fresh", "bot is not in the group");
+    // 25h 前的标记 → 过期；now 显式传入以避免测试在窗口边界抖动
+    db.run("UPDATE dead_targets SET marked_at = ? WHERE chat_key = ?", [
+      new Date(now - 25 * 3_600_000).toISOString(),
+      "group:fresh",
+    ]);
+    expect(reg.isDead("group:fresh", now)).toBe(false);
+    // 窗口内（23h 前）的标记仍生效
+    reg.markDead("group:recent", "bot is not in the group");
+    db.run("UPDATE dead_targets SET marked_at = ? WHERE chat_key = ?", [
+      new Date(now - 23 * 3_600_000).toISOString(),
+      "group:recent",
+    ]);
+    expect(reg.isDead("group:recent", now)).toBe(true);
+    db.close();
+  });
+
+  test("isDeadTargetError matches Chinese gateway hints", () => {
+    expect(isDeadTargetError("群不存在")).toBe(true);
+    expect(isDeadTargetError("机器人已被移出群聊")).toBe(true);
+    expect(isDeadTargetError("非法的 openid")).toBe(true);
+    expect(isDeadTargetError("不在群内")).toBe(true);
+    expect(isDeadTargetError("用户不存在")).toBe(true);
+    expect(isDeadTargetError("qq 已注销")).toBe(true);
+    expect(isDeadTargetError("网络超时")).toBe(false);
+  });
+
+  test("shouldProbeDead throttles probes to one per 10 minutes", () => {
+    const lastProbeAt = new Map<string, number>();
+    expect(shouldProbeDead("c2c:a", lastProbeAt, 1000)).toBe(true);
+    lastProbeAt.set("c2c:a", 1000);
+    expect(shouldProbeDead("c2c:a", lastProbeAt, 1000 + 599_999)).toBe(false);
+    expect(shouldProbeDead("c2c:a", lastProbeAt, 1000 + 600_000)).toBe(true);
+  });
   test("isDeadTargetError only matches unreachable-chat hints", () => {
     expect(isDeadTargetError("bot is not in the group")).toBe(true);
     expect(isDeadTargetError("network error")).toBe(false);
