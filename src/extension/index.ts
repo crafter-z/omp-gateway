@@ -29,7 +29,7 @@ export default function gatewayExtension(pi: ExtensionAPI) {
 	const z = pi.zod;
 
 	function headers(): Record<string, string> {
-		const h: Record<string, string> = { "content-type": "application/json" };
+		const h: Record<string, string> = { "content-type": "application/json", "x-omp-gateway-csrf": "1" };
 		if (token) h.authorization = `Bearer ${token}`;
 		return h;
 	}

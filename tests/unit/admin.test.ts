@@ -83,7 +83,7 @@ describe("AdminServer", () => {
 		try {
 			const res = await fetch(`${base}/api/jobs`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "x-omp-gateway-csrf": "1" },
 				body: JSON.stringify({
 					name: "n1",
 					schedule: { kind: "interval", expr: "5m" },
@@ -104,7 +104,7 @@ describe("AdminServer", () => {
 		try {
 			const res = await fetch(`${base}/api/jobs/j1`, {
 				method: "PATCH",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "x-omp-gateway-csrf": "1" },
 				body: JSON.stringify({ enabled: false }),
 			});
 			expect(res.status).toBe(200);
@@ -117,7 +117,7 @@ describe("AdminServer", () => {
 	test("DELETE /api/jobs/:id removes", async () => {
 		const { server, ctx, base } = await startServer();
 		try {
-			const res = await fetch(`${base}/api/jobs/j1`, { method: "DELETE" });
+			const res = await fetch(`${base}/api/jobs/j1`, { method: "DELETE", headers: { "x-omp-gateway-csrf": "1" } });
 			expect(res.status).toBe(200);
 			expect(ctx.removed).toContain("j1");
 		} finally {
@@ -130,11 +130,27 @@ describe("AdminServer", () => {
 		try {
 			const res = await fetch(`${base}/api/outbound/qq`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "x-omp-gateway-csrf": "1" },
 				body: JSON.stringify({ chatKey: "c2c:u1", text: "hi" }),
 			});
 			expect(res.status).toBe(200);
 			expect(ctx.sent).toEqual([{ chatKey: "c2c:u1", text: "hi" }]);
+		} finally {
+			server.stop();
+		}
+	});
+
+	test("POST without csrf header -> 403", async () => {
+		const { server, ctx, base } = await startServer();
+		try {
+			const res = await fetch(`${base}/api/outbound/qq`, {
+				method: "POST",
+				headers: { "content-type": "application/json" }, // 缺 x-omp-gateway-csrf
+				body: JSON.stringify({ chatKey: "c2c:u1", text: "hi" }),
+			});
+			expect(res.status).toBe(403);
+			expect(await res.json()).toEqual({ error: "missing csrf header" });
+			expect(ctx.sent).toHaveLength(0);
 		} finally {
 			server.stop();
 		}

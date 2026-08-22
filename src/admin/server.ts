@@ -152,6 +152,11 @@ export class AdminServer {
 			return new Response("upgrade failed", { status: 500 });
 		}
 		if (!authOk(this.opts.token, req)) return new Response("unauthorized", { status: 401 });
+		// CSRF 加固：跨站 POST 无法自定义 header（浏览器 drive-by），非 GET 一律要求
+		// x-omp-gateway-csrf: 1。GET 与 WS upgrade 不受影响。
+		if (req.method !== "GET" && req.headers.get("x-omp-gateway-csrf") !== "1") {
+			return json({ error: "missing csrf header" }, 403);
+		}
 
 		try {
 			switch (url.pathname) {
