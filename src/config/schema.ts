@@ -75,6 +75,8 @@ export const schedulerConfigSchema = z.object({
 	tick_s: z.number().int().min(1).default(60),
 	max_concurrent_jobs: z.number().int().min(1).default(4),
 	misfire_grace_s: z.number().int().min(0).default(300),
+	/** 执行超时判定窗口（秒）：claimed/running 台账超过此值才标 unknown；与 misfire 补跑宽限分离。 */
+	stale_execution_s: z.number().int().min(1).default(3600),
 	nudge_after_failures: z.number().int().min(1).default(3),
 	ledger: z.string().default("~/.omp-gateway/ledger.db"),
 	/** liveness 信号目录（ticker_heartbeat/last_success/last_error）；空 = 关闭。 */

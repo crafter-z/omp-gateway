@@ -14,7 +14,7 @@ import { expandHome } from "./config/load.ts";
 import { createLogger, type Logger } from "./util/logger.ts";
 import { scanSecrets } from "./util/scan.ts";
 import { acquireLock } from "./util/lock.ts";
-import { DeadTargetRegistry, isDeadTargetError } from "./util/deadTargets.ts";
+import { DeadTargetRegistry, isDeadTargetError, shouldProbeDead } from "./util/deadTargets.ts";
 import { DeliveryLedger } from "./util/deliveryLedger.ts";
 import { mirrorToSession } from "./util/sessionMirror.ts";
 import { JobStore } from "./scheduler/store.ts";
@@ -225,8 +225,14 @@ export class Daemon {
 	private stopping = false;
 	/** 实例锁句柄（平台锁：同一 ledger 不允许第二个 daemon 实例）。 */
 	private instanceLock?: { release(): Promise<void> };
-	/** Typing 指示器 debounce：chatKey → last sent ms。 */
+	/** Typing 指示器 debounce：chatKey → last sent ms。有界：超 500 删最旧。 */
 	private readonly typingSentAt = new Map<string, number>();
+	/** 死目标探活节流：chatKey → last probe ms（自愈用，见 shouldProbeDead）。 */
+	private readonly deadProbeAt = new Map<string, number>();
+	/** per-chat 串行化队列：chatKey → 尾部 chain promise（完成即清理，保持有界）。 */
+	private readonly chatQueues = new Map<string, Promise<void>>();
+	/** 在途投递 promise 集合：stop() 排空等待，防止关库后投递写台账崩溃。 */
+	private readonly inFlightDeliveries = new Set<Promise<void>>();
 
 	constructor(
 		private readonly cfg: GatewayConfig,
@@ -246,7 +252,7 @@ export class Daemon {
 		if (cfg.scheduler.ledger !== ":memory:") {
 			const lockPath = `${cfg.scheduler.ledger}.instance`;
 			try {
-				this.instanceLock = await acquireLock(lockPath, { timeoutMs: 5_000 });
+				this.instanceLock = await acquireLock(lockPath, { timeoutMs: 5_000, staleMs: 60_000 });
 			} catch {
 				this.started = false;
 				throw new Error(`another daemon instance holds the lock (${lockPath}) — refusing to start`);
@@ -304,9 +310,17 @@ export class Daemon {
 		// 投递出口（dead-target 短路 + 成功自愈）。
 		const qqSend = async (chatKey: string, text: string, sendOpts?: { msgId?: string; msgSeq?: number }) => {
 			const dead = this.deadTargets!;
+			let probing = false;
 			if (dead.isDead(chatKey)) {
-				log.warn("delivery skipped: dead target", { chatKey });
-				return;
+				if (!shouldProbeDead(chatKey, this.deadProbeAt)) {
+					log.warn("delivery skipped: dead target", { chatKey });
+					return;
+				}
+				// 探活自愈：≥10 分钟才放行一次真实发送。成功走下方正常路径（clear）；
+				// 失败且仍是死目标错误 → 按现有 markDead 逻辑标记并吞掉错误维持静默。
+				this.deadProbeAt.set(chatKey, Date.now());
+				probing = true;
+				log.info("dead target probe send", { chatKey });
 			}
 			try {
 				await sendText(
@@ -318,7 +332,10 @@ export class Daemon {
 				dead.clear(chatKey); // 自愈
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
-				if (isDeadTargetError(msg)) dead.markDead(chatKey, msg);
+				if (isDeadTargetError(msg)) {
+					dead.markDead(chatKey, msg);
+					if (probing) return; // 探活失败：目标确认仍死，维持短路语义
+				}
 				throw err;
 			}
 		};
@@ -369,6 +386,7 @@ export class Daemon {
 			tickS: cfg.scheduler.tick_s,
 			maxConcurrentJobs: cfg.scheduler.max_concurrent_jobs,
 			misfireGraceS: cfg.scheduler.misfire_grace_s,
+			staleExecutionS: cfg.scheduler.stale_execution_s,
 			onResult: (job, result) => void this.deliverJobResult(job, result),
 			log: (msg: string) => log.child("scheduler").info(msg),
 			livenessDir: cfg.scheduler.liveness_dir ? expandHome(cfg.scheduler.liveness_dir) : undefined,
@@ -389,6 +407,15 @@ export class Daemon {
 			() => log.info("qq gateway connected"),
 			(err) => log.error("qq gateway connect failed", { error: (err as Error).message }),
 		);
+		// admin 加固：非 loopback 绑定必须配置 token，否则拒绝启动
+		// （无鉴权的管理面暴露在局域网 = 任意 job CRUD + QQ 消息出口）。
+		const isLoopback = (host: string): boolean => host in { "127.0.0.1": true, "::1": true, localhost: true };
+		if (!isLoopback(cfg.admin.host.toLowerCase()) && cfg.admin.token === "") {
+			throw new Error(
+				`admin.host "${cfg.admin.host}" is not loopback and admin.token is empty — refusing to start; ` +
+					"set admin.token or bind admin.host to 127.0.0.1/::1/localhost",
+			);
+		}
 		this.admin = new AdminServer(
 			{ host: cfg.admin.host, port: cfg.admin.port, token: cfg.admin.token },
 			this.adminContext(),
@@ -404,7 +431,7 @@ export class Daemon {
 	): Promise<void> {
 		const ledger = this.deliveryLedger;
 		if (!ledger) return;
-		for (const row of ledger.sweepRecoverable()) {
+		for (const row of ledger.sweepRecoverable(30_000)) {
 			const text = row.recovered ? `♻️ Recovered reply — may be a duplicate:\n${row.text}` : row.text;
 			ledger.markAttempting(row.id);
 			try {
@@ -566,6 +593,21 @@ export class Daemon {
 	}
 
 	private async handleQqMessage(m: InboundMessage): Promise<void> {
+		// per-chat 串行化：gateway 对消息 fire-and-forget，同 chatKey 的并发消息若不
+		// 排队会同时 spawn 多个 omp -r 写同一 session 文件。链式排队保证 FIFO。
+		const key = m.chatKey;
+		const prev = this.chatQueues.get(key) ?? Promise.resolve();
+		const chain = prev.catch(() => {}).then(() => this.runQqMessage(m));
+		this.chatQueues.set(key, chain);
+		// 有界清理：仅当仍是链尾时删除（后续入队者已替换 Map 值）。
+		void chain.finally(() => {
+			if (this.chatQueues.get(key) === chain) this.chatQueues.delete(key);
+		});
+		return chain;
+	}
+
+	/** 原 handleQqMessage 消息处理主体（经 per-chat 队列串行调用）。 */
+	private async runQqMessage(m: InboundMessage): Promise<void> {
 		if (!this.runner || !this.delivery || !this.chatStore) return;
 		const log = this.logger.child("qq");
 		if (!this.isAllowed(m)) {
@@ -652,6 +694,7 @@ export class Daemon {
 		const now = Date.now();
 		const last = this.typingSentAt.get(m.chatKey) ?? 0;
 		if (now - last < 40_000) return;
+		if (this.typingSentAt.size > 500) this.typingSentAt.delete(this.typingSentAt.keys().next().value!);
 		this.typingSentAt.set(m.chatKey, now);
 		try {
 			await sendInputNotify(this.cfg.qq, { chatKey: m.chatKey, openid: openidOf(m.chatKey) }, { msgId: m.id });
@@ -724,9 +767,16 @@ export class Daemon {
 		}
 		return allow.allow_all_users || allow.users.includes(m.authorOpenid);
 	}
-
 	private async deliverJobResult(job: Job, result: RunResult): Promise<void> {
-		if (!this.delivery) return;
+		// 投递主体经 #trackDelivery 追踪：stop() 关库前排空，防止在 store 关闭后
+		// 仍写台账/mirror。fire() 层面不变。
+		const t = this.#trackDelivery(job, result);
+		return t;
+	}
+
+	#trackDelivery(job: Job, result: RunResult): Promise<void> {
+		const tracked = (async () => {
+ 		if (!this.delivery) return;
 
 		// 中断感知（hermes _is_interrupted 对等）：daemon 关闭中完成的 job 若呈现
 		// 成功，禁止把截断输出当完整成功投递——强制按失败投递诚实摘要。
@@ -785,6 +835,10 @@ export class Daemon {
 		} catch (err) {
 			this.logger.error("delivery failed", { job: job.name, error: (err as Error).message });
 		}
+		})();
+		this.inFlightDeliveries.add(tracked);
+		void tracked.finally(() => this.inFlightDeliveries.delete(tracked));
+		return tracked;
 	}
 
 	/** 向 admin 订阅者广播事件（WS /api/ws）。 */
@@ -799,6 +853,11 @@ export class Daemon {
 		this.scheduler?.stop();
 		await this.qq?.stop();
 		this.admin?.stop();
+		// 排空在途投递（10s 上限）：store 关闭后 delivery/ledger/mirror 不可再写。
+		await Promise.race([
+			Promise.allSettled([...this.inFlightDeliveries]),
+			Bun.sleep(10_000),
+		]);
 		this.store?.close();
 		await this.instanceLock?.release();
 		this.instanceLock = undefined;

@@ -63,6 +63,7 @@ function makeCfg(allowOverrides: Partial<GatewayConfig["qq"]["allow"]> = {}): Ga
 			tick_s: 3600,
 			max_concurrent_jobs: 2,
 			misfire_grace_s: 300,
+			stale_execution_s: 3600,
 			nudge_after_failures: 3,
 			ledger: ":memory:",
 			liveness_dir: "",
@@ -153,5 +154,72 @@ describe("daemon allowlist enforcement", () => {
 		const d = await startDaemon(makeCfg({ groups: ["groupY"] }));
 		await d["handleQqMessage"](msg({ chatKey: "group:groupY", authorOpenid: "whoever" }));
 		expect(sendCalls).toBeGreaterThan(0);
+	});
+});
+
+describe("per-chat message serialization", () => {
+	test("same chatKey: messages run FIFO, never overlapping", async () => {
+		let inFlight = 0;
+		let peak = 0;
+		const order: string[] = [];
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			if (url.includes("/app/getAppAccessToken")) {
+				return new Response(JSON.stringify({ access_token: "tok", expires_in: 7200 }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ id: "out" }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const d = await startDaemon(makeCfg({ allow_all_users: true }));
+		// 替换 runner 为可控 fake：记录并发峰值与完成顺序
+		const slowRunner = {
+			run: async (prompt: string) => {
+				inFlight++;
+				peak = Math.max(peak, inFlight);
+				await Bun.sleep(30);
+				order.push(prompt);
+				inFlight--;
+				return { ok: true, output: `done:${prompt}` };
+			},
+		} as never;
+		(d as unknown as { runner: unknown }).runner = slowRunner;
+
+		await Promise.all([
+			d["handleQqMessage"](msg({ id: "m1", text: "first" })),
+			d["handleQqMessage"](msg({ id: "m2", text: "second" })),
+			d["handleQqMessage"](msg({ id: "m3", text: "third" })),
+		]);
+		expect(peak).toBe(1); // 同 chat 严格串行
+		expect(order).toEqual(["first", "second", "third"]); // FIFO
+	});
+
+	test("different chatKeys run concurrently", async () => {
+		let inFlight = 0;
+		let peak = 0;
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			if (url.includes("/app/getAppAccessToken")) {
+				return new Response(JSON.stringify({ access_token: "tok", expires_in: 7200 }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ id: "out" }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const d = await startDaemon(makeCfg({ allow_all_users: true }));
+		const gate = Promise.withResolvers<void>();
+		const slowRunner = {
+			run: async () => {
+				inFlight++;
+				peak = Math.max(peak, inFlight);
+				await gate.promise;
+				inFlight--;
+				return { ok: true, output: "ok" };
+			},
+		} as never;
+		(d as unknown as { runner: unknown }).runner = slowRunner;
+
+		const a = d["handleQqMessage"](msg({ id: "a1", chatKey: "c2c:userA", authorOpenid: "userA", text: "a" }));
+		const b = d["handleQqMessage"](msg({ id: "b1", chatKey: "c2c:userB", authorOpenid: "userB", text: "b" }));
+		await Bun.sleep(20);
+		expect(peak).toBe(2); // 不同 chat 并行
+		gate.resolve();
+		await Promise.all([a, b]);
 	});
 });

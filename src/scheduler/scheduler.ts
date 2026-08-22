@@ -25,8 +25,10 @@ export interface SchedulerOptions {
   tickS: number;
   /** 最大并发执行数 */
   maxConcurrentJobs: number;
-  /** misfire 宽限窗口（秒）；M1 兼作 scanStale 的默认超时 */
+  /** misfire 补跑宽限窗口（秒）：scheduled_at 落在窗口内的超时 execution 才补跑 */
   misfireGraceS: number;
+  /** 执行超时判定窗口（秒）：claimed/running 超过此值标 unknown；缺省回退 misfireGraceS。 */
+  staleExecutionS?: number;
   /** 执行完成回调（daemon 投递 hook）。result 为 executor 原始产出，job 为触发时的快照。 */
   onResult?: (job: Job, result: RunResult) => void;
   /** 日志注入（缺省 console.error）。 */
@@ -196,6 +198,12 @@ export class Scheduler {
     if (!job || !job.enabled) return;
 
     if (this.activeCount >= this.opts.maxConcurrentJobs) {
+      // once job 没有下次触发，跳过即静默丢失——诚实记一条 failed 台账并清 next_run；
+      // interval/cron 下个周期自然重试，维持纯跳过。
+      if (job.schedule.kind === "once") {
+        this.ledger.markSkipped(job, "skipped: maxConcurrentJobs reached");
+        this.store.update(job.id, { next_run: null });
+      }
       this.log(`skip ${jobId}: maxConcurrentJobs (${this.opts.maxConcurrentJobs}) reached`);
       return;
     }
@@ -267,10 +275,10 @@ export class Scheduler {
    * 同时执行维护任务：liveness 心跳、台账/输出清理、once 留存清理。
    */
   private onTick(): void {
-    this.writeLiveness("ticker_heartbeat");
+    if (this.misfired.size > 1000) this.misfired.clear(); // 有界：全清仅影响重复补跑防护窗口
     // 稳态维护与 misfire 扫描解耦：即使没有超时台账，裁剪/留存也必须每 tick 执行。
     this.maintain();
-    const timeoutMs = this.opts.misfireGraceS * 1000;
+    const timeoutMs = (this.opts.staleExecutionS ?? this.opts.misfireGraceS) * 1000;
     const stale = this.ledger.scanStale(timeoutMs);
     for (const s of stale) {
       this.log(`execution ${s.id} (job ${s.job_id}) marked unknown: stale after ${timeoutMs}ms`);
